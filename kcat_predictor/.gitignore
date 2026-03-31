@@ -1,0 +1,71 @@
+# ============================================================
+# kcat_predictor — .gitignore
+# ============================================================
+
+# ---- Python cache -------------------------------------------
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# ---- Model checkpoints & weights ----------------------------
+*.ckpt
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.h5
+
+# ---- Data (large dataset files) -----------------------------
+data/
+
+# ---- Outputs (checkpoints, logs, plots, etc.) ---------------
+outputs/
+logs/
+
+# ---- Log files -----------------------------------------------
+*.log
+nohup.out
+train_probe.log
+
+# ---- WandB ---------------------------------------------------
+wandb/
+
+# ---- Database / Environment ---------------------------------
+*.db
+.env
+.venv/
+env/
+venv/
+
+# ---- OS / IDE -----------------------------------------------
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ---- Agent / Workflow / Framework dirs ----------------------
+.agent/
+.agents/
+.beads/
+.claude/
+.gemini/
+openspec/
+workflow/
+
+# ---- Documents / Prompts ------------------------------------
+/AGENTS.md
+/CLAUDE.md
+/architecture_audit_report.md
+/report_basemodel.md
+document/
+
+# ---- External repos -----------------------------------------
+esm_repo/

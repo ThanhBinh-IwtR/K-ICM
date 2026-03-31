@@ -1,0 +1,125 @@
+# ============================================================
+# ESM3-MoLFormer D2 LoRA — Training Configuration
+# Hardware: 2× NVIDIA L40S (48 GB VRAM each), num_gpus=2
+# Launch: CUDA_VISIBLE_DEVICES=2,3 torchrun --nproc_per_node=2 train.py --config configs/train_config.yaml
+# ============================================================
+
+# ---- Project -----------------------------------------------
+project:
+  name: "esm3-molformer-kcat-D2-LoRA"
+  seed: 42
+  output_dir: "outputs/"
+  checkpoint_dir: "outputs/checkpoints/"
+  log_dir: "outputs/logs/"
+
+# ---- Data --------------------------------------------------
+data:
+  train_csv: "data/train.csv"
+  val_csv:   "data/val.csv"
+  test_csv:  "data/test.csv"
+  predictions_csv: "outputs/test_predictions.csv"
+  sequence_col: "sequence"
+  smiles_col:   "reactant_smiles"
+  target_col:   "log10_value"
+  max_seq_len:  1024
+  num_workers:  4
+  pin_memory:   true
+
+# ---- Model -------------------------------------------------
+model:
+  esm3_variant:   "esm3_sm_open_v1"
+  d_esm3:         1536
+  substrate_encoder: "molformer"
+  d_substrate:    768
+  d_proj:         512
+  d_fusion:       512
+
+  molformer_model: "ibm/MoLFormer-XL-both-10pct"
+  molformer_max_length: 202
+  molformer_use_pooler: true
+
+  projection_normalize_input: true
+
+  esm3_lora:
+    r:              16
+    alpha:          32
+    dropout:        0.05
+    target_modules: ["layernorm_qkv.1"]   # verified from named_modules scan
+
+  cross_attention:
+    d_sub:          512
+    d_prot:         1536
+    n_heads:        8
+    dropout:        0.1
+
+  mlp:
+    hidden_dims:  [512, 256, 128]
+    dropouts:     [0.2, 0.1, 0.0]
+    activation:   "gelu"
+
+# ---- Training ----------------------------------------------
+training:
+  num_gpus:       4
+  ddp_backend:    "nccl"
+  precision:      "bf16-mixed"
+  find_unused_parameters: false
+
+  batch_size_per_gpu:          2
+  gradient_accumulation_steps: 32
+  effective_batch_size:        256
+
+  max_epochs:           200
+  val_every_n_epochs:   1
+
+  loss:        "huber"
+  huber_beta:  1.0
+
+  gradient_clip_norm: 1.0
+
+  lr:
+    task:          2.0e-4
+    molformer:     2.0e-5
+    esm3_lora:     1.0e-5
+
+  weight_decay:    1.0e-2
+  adam_eps:        1.0e-8
+  adam_betas:      [0.9, 0.999]
+
+  scheduler:
+    warmup_steps:        100   # Increased for LoRA cold-start stability (was 50)
+    min_lr_ratio:        0.01
+
+  early_stopping:
+    monitor:    "val/r2"
+    mode:       "max"
+    patience:   40
+    min_delta:  0.001
+
+  checkpoint:
+    save_top_k:   3
+    monitor:      "val/r2"
+    mode:         "max"
+    filename:     "epoch{epoch:03d}-r2{val/r2:.4f}"
+
+# ---- Logging -----------------------------------------------
+logging:
+  backend:       "wandb"
+  wandb_project: "kcat-prediction"
+  wandb_entity:  null
+  log_every_n_steps: 10
+  log_gpu_memory:    true
+
+# ---- Evaluation --------------------------------------------
+evaluation:
+  metrics:
+    - "r2"
+    - "rmse"
+    - "mae"
+    - "spearman"
+    - "pearson"
+  primary_metric: "r2"
+
+# ---- Reproducibility ----------------------------------------
+reproducibility:
+  deterministic: false
+  benchmark:     false
