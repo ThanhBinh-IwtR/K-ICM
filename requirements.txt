@@ -1,0 +1,19 @@
+# ESM2-DMPNN Baseline — Dependencies
+# DEVIATION: Blueprint specifies esm>=3.0.0 (ESM-3). Environment has fair-esm==2.0.0 (ESM-2).
+#            All ESM-3 API calls are replaced with ESM-2 equivalents and marked DEVIATION.
+# DEVIATION: Blueprint specifies chemprop>=2.0.0. chemprop==1.6.1 is installed.
+#            MPNN featurization uses chemprop v1 API (MPNEncoder + BatchMolGraph).
+
+torch>=2.2.0
+fair-esm>=2.0.0          # DEVIATION: was esm>=3.0.0; using ESM-2 from fair-esm
+chemprop>=1.6.1          # DEVIATION: was chemprop>=2.0.0; using v1.6.1 API
+rdkit>=2023.9.1          # SMILES parsing & validation
+scipy>=1.12.0
+scikit-learn>=1.4.0
+pandas>=2.0.0
+numpy>=1.26.0
+pyyaml>=6.0
+wandb>=0.16.0
+tqdm>=4.66.0
+transformers>=4.40.0     # get_cosine_schedule_with_warmup
+setproctitle>=1.3.0      # process title for hardware monitoring
