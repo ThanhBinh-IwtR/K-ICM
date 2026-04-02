@@ -78,8 +78,71 @@ class MoLFormerEncoder(nn.Module):
         n_params = sum(p.numel() for p in self._model.parameters())
         logger.info(
             f"[MoLFormerEncoder] Loaded {model_name}  "
-            f"d_output={d_output}  params={n_params/1e6:.1f}M  trainable=True"
+            f"d_output={d_output}  params={n_params/1e6:.1f}M"
         )
+
+        self._frozen = False
+
+    # ------------------------------------------------------------------
+    # Freeze / LoRA helpers
+    # ------------------------------------------------------------------
+
+    def freeze(self) -> None:
+        """Freeze ALL parameters in the underlying MoLFormer model."""
+        for param in self._model.parameters():
+            param.requires_grad_(False)
+        self._frozen = True
+        n_params = sum(p.numel() for p in self._model.parameters())
+        logger.info(
+            "[MoLFormerEncoder] All parameters frozen. "
+            "(%.1fM params, 0 trainable)", n_params / 1e6,
+        )
+
+    def apply_lora(
+        self,
+        r: int,
+        alpha: int,
+        dropout: float,
+        target_modules: list[str],
+    ) -> None:
+        """Wrap the frozen MoLFormer with LoRA adapters (peft).
+
+        Must be called AFTER freeze() — peft adds new trainable adapters
+        on top of frozen base weights.
+        """
+        from peft import LoraConfig, get_peft_model  # noqa: PLC0415
+
+        lora_config = LoraConfig(
+            r=r,
+            lora_alpha=alpha,
+            target_modules=target_modules,
+            lora_dropout=dropout,
+            bias="none",
+            inference_mode=False,
+        )
+        self._model = get_peft_model(self._model, lora_config)
+
+        trainable = sum(p.numel() for p in self._model.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in self._model.parameters())
+        pct = 100.0 * trainable / total if total > 0 else 0.0
+        logger.info(
+            "[MoLFormerEncoder] LoRA applied  r=%d  alpha=%d  dropout=%.2f  "
+            "trainable=%d (%.2f%%)",
+            r, alpha, dropout, trainable, pct,
+        )
+
+    def lora_parameters(self):
+        """Yield only parameters where requires_grad is True.
+
+        Used by kicm_module.py to build the molformer_lora optimizer group.
+        """
+        for param in self._model.parameters():
+            if param.requires_grad:
+                yield param
+
+    # ------------------------------------------------------------------
+    # Forward
+    # ------------------------------------------------------------------
 
     def forward(self, smiles_list: list[str]) -> Tensor:
         """

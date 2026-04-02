@@ -1,12 +1,13 @@
 """KICMLightningModule — PyTorch Lightning wrapper for the KICM D2 model.
 
-D2 LoRA: ESM-3 frozen with LoRA adapters, MoLFormer fully trainable,
+D2 LoRA: ESM-3 frozen with LoRA adapters, MoLFormer freeze/LoRA configurable,
 B1 unidirectional cross-attention. No phase-based unfreezing, no augmentation.
 
-Optimizer param groups (5):
+Optimizer param groups (dynamic):
     task_decay, task_no_decay           — lr.task
-    molformer_decay, molformer_no_decay — lr.molformer
-    esm3_lora                           — lr.esm3_lora (single group, no bias)
+    molformer_decay, molformer_no_decay — lr.molformer  (only when molformer trainable)
+    molformer_lora                      — lr.molformer_lora (only when frozen + LoRA)
+    esm3_lora                           — lr.esm3_lora
 """
 from __future__ import annotations
 
@@ -272,18 +273,37 @@ class KICMLightningModule(pl.LightningModule):
         lora_params = list(self.model.esm3_encoder.lora_parameters())
         lora_ids = {id(p) for p in lora_params}
 
-        # Identify MoLFormer parameters
-        molformer_param_ids = set(id(p) for p in self.model.substrate_encoder.parameters())
+        # Determine MoLFormer state
+        mol_frozen = self.model.substrate_encoder._frozen
+        model_cfg = self.config.get("model", {})
+        mol_lora_enabled = model_cfg.get("molformer_lora", {}).get("enabled", False)
+
+        # Identify MoLFormer parameters (by id) for routing
+        molformer_param_ids = {id(p) for p in self.model.substrate_encoder.parameters()}
 
         task_decay, task_no_decay = [], []
         molformer_decay, molformer_no_decay = [], []
+        molformer_lora_params: list = []
+
+        if mol_frozen and mol_lora_enabled:
+            # Frozen + LoRA: collect only LoRA (requires_grad=True) params
+            molformer_lora_params = list(
+                self.model.substrate_encoder.lora_parameters()
+            )
+            mol_lora_ids = {id(p) for p in molformer_lora_params}
+        else:
+            mol_lora_ids = set()
 
         for name, param in self.model.named_parameters():
             if not param.requires_grad:
                 continue
-            if id(param) in lora_ids:
-                continue  # handled separately as single group
-            elif id(param) in molformer_param_ids:
+            pid = id(param)
+            if pid in lora_ids:
+                continue  # handled as esm3_lora group
+            if pid in mol_lora_ids:
+                continue  # handled as molformer_lora group
+            if pid in molformer_param_ids:
+                # Only reached when MoLFormer is fully trainable
                 if self._is_no_decay_param(name):
                     molformer_no_decay.append(param)
                 else:
@@ -295,27 +315,49 @@ class KICMLightningModule(pl.LightningModule):
                     task_decay.append(param)
 
         lr_task = lr_cfg["task"]
-        lr_molformer = lr_cfg["molformer"]
         lr_esm3_lora = lr_cfg["esm3_lora"]
 
-        param_groups = [
-            {"params": task_decay,      "lr": lr_task,       "weight_decay": wd,  "name": "task_decay"},
-            {"params": task_no_decay,   "lr": lr_task,       "weight_decay": 0.0, "name": "task_no_decay"},
-            {"params": molformer_decay, "lr": lr_molformer,  "weight_decay": wd,  "name": "molformer_decay"},
-            {"params": molformer_no_decay, "lr": lr_molformer, "weight_decay": 0.0, "name": "molformer_no_decay"},
-            {"params": lora_params,     "lr": lr_esm3_lora,  "weight_decay": wd,  "name": "esm3_lora"},
-            # Note: single group because LoRA has no bias/norm params (bias="none")
-        ]
+        # Build param groups — only include non-empty groups (no dead code)
+        param_groups = []
+        if task_decay:
+            param_groups.append(
+                {"params": task_decay, "lr": lr_task, "weight_decay": wd, "name": "task_decay"},
+            )
+        if task_no_decay:
+            param_groups.append(
+                {"params": task_no_decay, "lr": lr_task, "weight_decay": 0.0, "name": "task_no_decay"},
+            )
 
-        logger.info(
-            "[KICMLightningModule] Param groups: "
-            "task_decay=%d  task_no_decay=%d  "
-            "molformer_decay=%d  molformer_no_decay=%d  "
-            "esm3_lora=%d",
-            len(task_decay), len(task_no_decay),
-            len(molformer_decay), len(molformer_no_decay),
-            len(lora_params),
+        # MoLFormer groups: depends on state
+        if not mol_frozen:
+            # Fully trainable — original decay/no_decay groups
+            lr_molformer = lr_cfg["molformer"]
+            if molformer_decay:
+                param_groups.append(
+                    {"params": molformer_decay, "lr": lr_molformer, "weight_decay": wd, "name": "molformer_decay"},
+                )
+            if molformer_no_decay:
+                param_groups.append(
+                    {"params": molformer_no_decay, "lr": lr_molformer, "weight_decay": 0.0, "name": "molformer_no_decay"},
+                )
+        elif mol_lora_enabled and molformer_lora_params:
+            # Frozen + LoRA — single LoRA group
+            lr_mol_lora = lr_cfg["molformer_lora"]
+            param_groups.append(
+                {"params": molformer_lora_params, "lr": lr_mol_lora, "weight_decay": wd, "name": "molformer_lora"},
+            )
+        # else: frozen, no LoRA — no molformer groups at all (saves optimizer RAM)
+
+        if lora_params:
+            param_groups.append(
+                {"params": lora_params, "lr": lr_esm3_lora, "weight_decay": wd, "name": "esm3_lora"},
+            )
+
+        # Summary log
+        group_summary = "  ".join(
+            f"{g['name']}={len(g['params'])}" for g in param_groups
         )
+        logger.info("[KICMLightningModule] Param groups: %s", group_summary)
 
         optimizer = torch.optim.AdamW(
             param_groups,
@@ -336,8 +378,8 @@ class KICMLightningModule(pl.LightningModule):
 
         logger.info(
             "[KICMLightningModule] Optimizer: AdamW  total_steps=%d  warmup=%d  "
-            "lr_task=%.2e  lr_molformer=%.2e  lr_esm3_lora=%.2e",
-            total_steps, warmup_steps, lr_task, lr_molformer, lr_esm3_lora,
+            "groups=%s",
+            total_steps, warmup_steps, group_summary,
         )
 
         return {
