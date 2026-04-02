@@ -1,12 +1,13 @@
 # ============================================================
-# ESM3-MoLFormer D2 LoRA — Training Configuration
-# Hardware: 2× NVIDIA L40S (48 GB VRAM each), num_gpus=2
-# Launch: CUDA_VISIBLE_DEVICES=2,3 torchrun --nproc_per_node=2 train.py --config configs/train_config.yaml
+# ESM3-MoLFormer D2 MolFrozen — Training Configuration
+# Hardware: 4× NVIDIA GPU, num_gpus=4
+# Date: 2026-03-31
+# Launch: CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 train.py --config configs/train_config.yaml
 # ============================================================
 
 # ---- Project -----------------------------------------------
 project:
-  name: "esm3-molformer-kcat-D2-LoRA"
+  name: "esm3-molformer-kcat-CA-MolLoRA"
   seed: 42
   output_dir: "outputs/"
   checkpoint_dir: "outputs/checkpoints/"
@@ -38,13 +39,27 @@ model:
   molformer_max_length: 202
   molformer_use_pooler: true
 
+  molformer_frozen: true
+
+  molformer_lora:
+    enabled:        true        # set true in experiment 2, do not change now
+    r:              12
+    alpha:          16
+    dropout:        0.05
+    target_modules: ["attention.self.query",
+      "attention.self.key",
+      "attention.self.value",
+      "attention.output.dense",
+      "intermediate.dense",
+      "output.dense"]           # fill after named_modules scan, leave empty for now
+
   projection_normalize_input: true
 
   esm3_lora:
-    r:              16
-    alpha:          32
+    r:              12
+    alpha:          24
     dropout:        0.05
-    target_modules: ["layernorm_qkv.1"]   # verified from named_modules scan
+    target_modules: ["layernorm_qkv.1", "output_projection", "ffn.1"]   # verified from named_modules scan
 
   cross_attention:
     d_sub:          512
@@ -59,16 +74,16 @@ model:
 
 # ---- Training ----------------------------------------------
 training:
-  num_gpus:       4
+  num_gpus:       2
   ddp_backend:    "nccl"
   precision:      "bf16-mixed"
   find_unused_parameters: false
 
   batch_size_per_gpu:          2
-  gradient_accumulation_steps: 32
+  gradient_accumulation_steps: 128
   effective_batch_size:        256
 
-  max_epochs:           200
+  max_epochs:           100
   val_every_n_epochs:   1
 
   loss:        "huber"
@@ -78,21 +93,22 @@ training:
 
   lr:
     task:          2.0e-4
-    molformer:     2.0e-5
-    esm3_lora:     1.0e-5
+    molformer:   5.0e-5    # irrelevant while molformer_frozen: true
+    esm3_lora:     7.0e-6
+    molformer_lora: 5.0e-5   # only used when molformer_lora.enabled is true
 
   weight_decay:    1.0e-2
   adam_eps:        1.0e-8
   adam_betas:      [0.9, 0.999]
 
   scheduler:
-    warmup_steps:        100   # Increased for LoRA cold-start stability (was 50)
+    warmup_steps:        100    # Reduced since MoLFormer removed from optimizer
     min_lr_ratio:        0.01
 
   early_stopping:
     monitor:    "val/r2"
     mode:       "max"
-    patience:   40
+    patience:   20
     min_delta:  0.001
 
   checkpoint:

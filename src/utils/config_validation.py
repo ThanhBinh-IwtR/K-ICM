@@ -69,14 +69,28 @@ def validate_config(config: dict) -> None:
 
     # LR validation
     lr_cfg = train_cfg.get("lr", {})
-    assert "molformer" in lr_cfg, (
-        "lr.molformer must be set for D2 config"
-    )
+
+    # MoLFormer LR depends on freeze/LoRA state
+    molformer_frozen = model_cfg.get("molformer_frozen", False)
+    mol_lora_enabled = model_cfg.get("molformer_lora", {}).get("enabled", False)
+
+    if not molformer_frozen:
+        # Fully trainable — require lr.molformer
+        assert "molformer" in lr_cfg, (
+            "lr.molformer must be set when molformer_frozen is false"
+        )
+        assert lr_cfg["molformer"] < lr_cfg.get("task", 1e-4), (
+            f"lr.molformer ({lr_cfg['molformer']}) should be < lr.task ({lr_cfg.get('task')})"
+        )
+    elif mol_lora_enabled:
+        # Frozen + LoRA — require lr.molformer_lora
+        assert "molformer_lora" in lr_cfg, (
+            "lr.molformer_lora must be set when molformer_lora.enabled is true"
+        )
+    # else: frozen, no LoRA — no molformer LR needed
+
     assert "esm3_lora" in lr_cfg, (
         "lr.esm3_lora must be set for D2 LoRA config"
-    )
-    assert lr_cfg["molformer"] < lr_cfg.get("task", 1e-4), (
-        f"lr.molformer ({lr_cfg['molformer']}) should be < lr.task ({lr_cfg.get('task')})"
     )
     assert lr_cfg["esm3_lora"] < lr_cfg.get("task", 1e-4), (
         f"lr.esm3_lora ({lr_cfg['esm3_lora']}) should be < lr.task ({lr_cfg.get('task')})"

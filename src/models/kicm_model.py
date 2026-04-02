@@ -64,13 +64,33 @@ class KICMModel(nn.Module):
             target_modules=lora_cfg.get("target_modules", None),
         )
 
-        # Substrate encoder (MoLFormer-XL, fully trainable)
+        # Substrate encoder (MoLFormer-XL)
         self.substrate_encoder = MoLFormerEncoder(
             model_name=model_cfg.get("molformer_model", "ibm/MoLFormer-XL-both-10pct"),
             max_length=model_cfg.get("molformer_max_length", 202),
             use_pooler=model_cfg.get("molformer_use_pooler", True),
             d_output=d_substrate,
         )
+
+        # MoLFormer freeze / LoRA (backward-compatible: default = fully trainable)
+        molformer_frozen: bool = model_cfg.get("molformer_frozen", False)
+        mol_lora_cfg: dict = model_cfg.get("molformer_lora", {})
+        mol_lora_enabled: bool = mol_lora_cfg.get("enabled", False)
+
+        if molformer_frozen:
+            self.substrate_encoder.freeze()
+
+        if mol_lora_enabled:
+            if not molformer_frozen:
+                raise ValueError(
+                    "molformer_lora.enabled requires molformer_frozen: true"
+                )
+            self.substrate_encoder.apply_lora(
+                r=mol_lora_cfg.get("r", 8),
+                alpha=mol_lora_cfg.get("alpha", 16),
+                dropout=mol_lora_cfg.get("dropout", 0.05),
+                target_modules=mol_lora_cfg.get("target_modules", []),
+            )
 
         # Projection: d_substrate → d_proj
         self.substrate_proj = ProjectionLayer(
@@ -93,12 +113,16 @@ class KICMModel(nn.Module):
             activation=mlp_cfg.get("activation", "gelu"),
         )
 
+        mol_status = "frozen" if molformer_frozen else "trainable"
+        if mol_lora_enabled:
+            mol_status += "+lora"
+
         logger.info(
             "[KICMModel] Constructed  "
             "esm=%s  d_esm=%d  d_sub=%d  d_proj=%d  d_fusion=%d  "
-            "lora_r=%s  cross_attn=B1(uni)",
+            "lora_r=%s  cross_attn=B1(uni)  molformer=%s",
             esm_variant, d_esm, d_substrate, d_proj, d_fusion,
-            lora_cfg.get("r", "none"),
+            lora_cfg.get("r", "none"), mol_status,
         )
 
     # ------------------------------------------------------------------
