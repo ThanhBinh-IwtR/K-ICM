@@ -161,7 +161,7 @@ def main() -> None:
         mode=ckpt_cfg.get("mode", "max"),
         save_top_k=ckpt_cfg.get("save_top_k", 3),
         save_last=True,
-        save_weights_only=True,      # prevents pickling LightningAdamW
+        save_weights_only=False,
         auto_insert_metric_name=False,
     )
     early_stop = EarlyStopping(
@@ -217,6 +217,16 @@ def main() -> None:
         # Only rank 0 runs test — other DDP ranks would OOM trying to load
         # a second model on the same GPU.
         rank = int(os.environ.get("LOCAL_RANK", 0))
+
+        # Tear down DDP process group before spawning single-GPU test trainer.
+        # Without this, non-rank-0 processes wait for NCCL collectives that
+        # never arrive → 30-min ALLGATHER timeout. (S13 pre-existing fix)
+        import torch.distributed as dist
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier()  # ensure all ranks reach this point
+            dist.destroy_process_group()
+            _log.info("[train] DDP process group destroyed — rank %d", rank)
+
         if rank == 0:
             _log.info("[train] Building single-GPU test trainer (rank 0 only).")
 
@@ -238,6 +248,10 @@ def main() -> None:
                 logger=loggers,
             )
             test_trainer.test(model, datamodule=datamodule, ckpt_path=best_ckpt)
+
+            # Explicit hook cleanup (M-05)
+            if hasattr(model, 'model') and hasattr(model.model, 'esm3_encoder'):
+                model.model.esm3_encoder.remove_hooks()
 
 
 if __name__ == "__main__":

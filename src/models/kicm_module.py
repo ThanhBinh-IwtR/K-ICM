@@ -1,35 +1,37 @@
-"""KICMLightningModule — PyTorch Lightning wrapper for the KICM D2 model.
+"""KICMLightningModule — PyTorch Lightning wrapper for Phase E.
 
-D2 LoRA: ESM-3 frozen with LoRA adapters, MoLFormer freeze/LoRA configurable,
-B1 unidirectional cross-attention. No phase-based unfreezing, no augmentation.
+Phase E: ESM-3 (frozen, optional LoRA) + BioT5+ (trainable) + Multi-Query CA + FiLM.
 
 Optimizer param groups (dynamic):
-    task_decay, task_no_decay           — lr.task
-    molformer_decay, molformer_no_decay — lr.molformer  (only when molformer trainable)
-    molformer_lora                      — lr.molformer_lora (only when frozen + LoRA)
-    esm3_lora                           — lr.esm3_lora
+    task_decay, task_no_decay           — lr.task  (incl. Scalar Mix layer_weights)
+    biot5_decay, biot5_no_decay         — lr.biot5
+    esm3_lora                           — lr.esm3_lora (only when enabled)
 """
 from __future__ import annotations
 
 import logging
 import math
-from typing import Any
+from typing import Any, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import numpy as np
 
 import torch
-import torch.nn as nn
+import torch.nn.functional as F
 from torch import Tensor
 from torch.optim.lr_scheduler import LambdaLR
 
 import pytorch_lightning as pl
+from torchmetrics import MeanMetric
 
 from .kicm_model import KICMModel
-from ..training.metrics import compute_metrics
+from ..training.metrics import compute_metrics, all_gather_tensors
 
 logger = logging.getLogger(__name__)
 
 
 class KICMLightningModule(pl.LightningModule):
-    """Lightning module wrapping KICMModel with LoRA-based ESM-3 adaptation.
+    """Lightning module wrapping KICMModel for Phase E.
 
     Args:
         config: Full training config dict (same structure as train_config.yaml).
@@ -43,15 +45,24 @@ class KICMLightningModule(pl.LightningModule):
         # Build the underlying model (freeze + LoRA applied inside KICMModel.__init__)
         self.model = KICMModel(config)
 
-        # Loss
-        train_cfg = config["training"]
-        self.criterion = nn.SmoothL1Loss(beta=train_cfg["huber_beta"])
+        # Loss — Huber(delta=4.0) (S14-01)
+        # Quadratic for |error|≤4, linear for |error|>4 — no dead gradient zones.
+        # delta=4.0 matches previous clamp threshold; MSE+clamp replaced (S12-01→S14-01).
+        # self.criterion removed: loss computed inline in training_step via F.huber_loss
 
         # Epoch-level collection buffers
         self.val_preds: list[Tensor] = []
         self.val_targets: list[Tensor] = []
         self.test_preds: list[Tensor] = []
         self.test_targets: list[Tensor] = []
+
+        # Epoch-level condition coverage metrics (avoid noisy per-step logging)
+        # sync_on_compute=True (default): all-reduces across ranks during .compute()
+        # at epoch end — one ALLREDUCE per epoch, not a desync risk.
+        # (S10-01 REVERT of Deviation 131: default sync restored;
+        #  root cause of S9 DDP issue was S7-01, already fixed.)
+        self.ph_coverage_metric = MeanMetric()   # default sync_on_compute=True — all-reduces at epoch end
+        self.temp_coverage_metric = MeanMetric() # default sync_on_compute=True
 
     # ------------------------------------------------------------------
     # Forward
@@ -60,28 +71,94 @@ class KICMLightningModule(pl.LightningModule):
     def forward(
         self,
         sequence_tokens: Tensor,
-        padding_mask: Tensor,
-        smiles_list: list[str],
+        esm_pad_mask: Tensor,
+        biot5_input_ids: Tensor,
+        biot5_attention_mask: Tensor,
+        ph: Tensor,
+        temp: Tensor,
+        ph_known: Tensor,
+        temp_known: Tensor,
+        cofactor_fp: Tensor,
     ) -> Tensor:
-        return self.model(sequence_tokens, padding_mask, smiles_list)
+        return self.model(
+            sequence_tokens, esm_pad_mask,
+            biot5_input_ids, biot5_attention_mask,
+            ph, temp, ph_known, temp_known,
+            cofactor_fp,
+        )
+
+    def _forward_batch(self, batch: dict) -> Tensor:
+        """Extract all 9 fields from batch dict and call forward."""
+        _required = {"sequence_tokens", "esm_pad_mask", "biot5_input_ids",
+                     "biot5_attention_mask", "ph", "temp", "ph_known", "temp_known",
+                     "cofactor_fp"}
+        missing = _required - set(batch.keys())
+        if missing:
+            raise ValueError(f"_forward_batch: missing batch keys: {missing}")
+        return self(
+            sequence_tokens=batch["sequence_tokens"],
+            esm_pad_mask=batch["esm_pad_mask"],
+            biot5_input_ids=batch["biot5_input_ids"],
+            biot5_attention_mask=batch["biot5_attention_mask"],
+            ph=batch["ph"],
+            temp=batch["temp"],
+            ph_known=batch["ph_known"],
+            temp_known=batch["temp_known"],
+            cofactor_fp=batch["cofactor_fp"],
+        )
 
     # ------------------------------------------------------------------
     # Training
     # ------------------------------------------------------------------
 
     def training_step(self, batch: dict, batch_idx: int) -> Tensor:
-        sequence_tokens = batch["sequence_tokens"]
-        padding_mask = batch["padding_mask"]
-        smiles_list = batch["smiles"]
-        targets = batch["targets"].squeeze(-1)  # [B,1] -> [B]
+        preds = self._forward_batch(batch)
+        targets = batch["targets"].reshape(-1)  # [B] safe for B=1
         batch_size = targets.size(0)
 
-        preds = self(sequence_tokens, padding_mask, smiles_list)
-        loss = self.criterion(preds, targets)
+        # Huber(delta=4.0): quadratic for |error|≤4, linear for |error|>4 (S14-01)
+        # Preserves gradient signal for outliers — non-zero linear gradient at |error|>4.
+        # delta=4.0 matches previous MSE+outlier-cap threshold — same robustness, no dead zones.
+        loss = F.huber_loss(preds, targets, delta=4.0, reduction='mean')
 
+        # S10-12: train/loss step-level sync is safe (on_step=True, sync_dist=True).
+        # on_epoch=True accumulation must NOT use sync_dist=True — Lightning queues
+        # ALLREDUCE to fire at epoch boundary, colliding with MeanMetric ALLGATHER
+        # in on_train_epoch_end (→ SeqNum mismatch → 30-min NCCL timeout).
+        # Architectural rule: in training_step, sync_dist=True is ONLY safe with
+        # on_step=True, on_epoch=False. Epoch-level sync belongs in on_train_epoch_end.
+        # train/loss epoch average is computed from rank-0 step values — sufficient
+        # for monitoring purposes (loss curves don't need cross-rank epoch sync).
         self.log("train/loss", loss,
-                 on_step=True, on_epoch=True, prog_bar=True, sync_dist=True,
+                 on_step=True, on_epoch=True, prog_bar=True, sync_dist=False,
                  batch_size=batch_size)
+
+        # Condition coverage — accumulate over epoch via MeanMetric
+        self.ph_coverage_metric.update(batch["ph_known"].float())
+        self.temp_coverage_metric.update(batch["temp_known"].float())
+
+        # FiLM gamma/beta statistics (from last forward pass, detached)
+        # sync_dist=False: FiLM stats are diagnostic — rank-0 values are sufficient.
+        # on_epoch=True + sync_dist=True in training_step causes NCCL desync (S10-12).
+        if hasattr(self.model, "_last_gamma"):
+            self.log("film/gamma_mean", self.model._last_gamma.mean(),
+                     on_step=False, on_epoch=True, sync_dist=False, batch_size=batch_size)
+            self.log("film/gamma_std", self.model._last_gamma.std(),
+                     on_step=False, on_epoch=True, sync_dist=False, batch_size=batch_size)
+            self.log("film/beta_mean", self.model._last_beta.mean(),
+                     on_step=False, on_epoch=True, sync_dist=False, batch_size=batch_size)
+            self.log("film/beta_std", self.model._last_beta.std(),
+                     on_step=False, on_epoch=True, sync_dist=False, batch_size=batch_size)
+        if hasattr(self.model, "_last_gamma2"):
+            self.log("film/gamma2_mean", self.model._last_gamma2.mean(),
+                     on_step=False, on_epoch=True, sync_dist=False, batch_size=batch_size)
+            self.log("film/gamma2_std", self.model._last_gamma2.std(),
+                     on_step=False, on_epoch=True, sync_dist=False, batch_size=batch_size)
+            self.log("film/beta2_mean", self.model._last_beta2.mean(),
+                     on_step=False, on_epoch=True, sync_dist=False, batch_size=batch_size)
+            self.log("film/beta2_std", self.model._last_beta2.std(),
+                     on_step=False, on_epoch=True, sync_dist=False, batch_size=batch_size)
+
         return loss
 
     # ------------------------------------------------------------------
@@ -89,61 +166,60 @@ class KICMLightningModule(pl.LightningModule):
     # ------------------------------------------------------------------
 
     def validation_step(self, batch: dict, batch_idx: int) -> None:
-        preds = self(
-            batch["sequence_tokens"],
-            batch["padding_mask"],
-            batch["smiles"],
-        )
-        targets = batch["targets"].squeeze(-1)
+        preds = self._forward_batch(batch)
+        targets = batch["targets"].reshape(-1)  # [B] safe for B=1
         self.val_preds.append(preds.detach().cpu().reshape(-1))
         self.val_targets.append(targets.detach().cpu().reshape(-1))
 
     def on_validation_epoch_end(self) -> None:
-        if not self.val_preds:
+        # S7-01 FIX: Always participate in all_gather collectives even with
+        # empty local data to prevent NCCL desync across DDP ranks.
+        local_preds = (
+            torch.cat(self.val_preds).float()
+            if self.val_preds
+            else torch.tensor([], dtype=torch.float32)
+        )
+        local_targets = (
+            torch.cat(self.val_targets).float()
+            if self.val_targets
+            else torch.tensor([], dtype=torch.float32)
+        )
+
+        all_preds = all_gather_tensors(local_preds).numpy()
+        all_targets = all_gather_tensors(local_targets).numpy()
+
+        self.val_preds.clear()
+        self.val_targets.clear()
+
+        if len(all_preds) < 2:
             return
-
-        local_preds = torch.cat(self.val_preds).float()
-        local_targets = torch.cat(self.val_targets).float()
-
-        gathered_preds = self.all_gather(local_preds)
-        gathered_targets = self.all_gather(local_targets)
-
-        all_preds = gathered_preds.reshape(-1).cpu().numpy()
-        all_targets = gathered_targets.reshape(-1).cpu().numpy()
 
         try:
             metrics = compute_metrics(all_preds, all_targets)
         except ValueError as exc:
             logger.warning("[KICMLightningModule] Could not compute val metrics: %s", exc)
-            self.val_preds.clear()
-            self.val_targets.clear()
             return
 
-        self.log("val/r2", metrics["r2"], sync_dist=False, prog_bar=True)
-        self.log("val/rmse", metrics["rmse"], sync_dist=False, prog_bar=True)
-        self.log("val/mae", metrics["mae"], sync_dist=False)
-        self.log("val/pcc", metrics["pearson"], sync_dist=False)
-        self.log("val/scc", metrics["spearman"], sync_dist=False)
+        # Metrics are computed on all-gathered data — identical on all ranks.
+        # No DDP sync needed here (would double-sync and risk NCCL desync).
+        self.log("val/r2", metrics["r2"], prog_bar=True)
+        self.log("val/rmse", metrics["rmse"], prog_bar=True)
+        self.log("val/mae", metrics["mae"])
+        self.log("val/pcc", metrics["pearson"])
+        self.log("val/scc", metrics["spearman"])
 
         logger.info(
             "[KICMLightningModule] val  r2=%.4f  rmse=%.4f  pcc=%.4f  scc=%.4f",
             metrics["r2"], metrics["rmse"], metrics["pearson"], metrics["spearman"],
         )
 
-        self.val_preds.clear()
-        self.val_targets.clear()
-
     # ------------------------------------------------------------------
     # Test
     # ------------------------------------------------------------------
 
     def test_step(self, batch: dict, batch_idx: int) -> None:
-        preds = self(
-            batch["sequence_tokens"],
-            batch["padding_mask"],
-            batch["smiles"],
-        )
-        targets = batch["targets"].squeeze(-1)
+        preds = self._forward_batch(batch)
+        targets = batch["targets"].reshape(-1)  # [B] safe for B=1
         self.test_preds.append(preds.detach().cpu().reshape(-1))
         self.test_targets.append(targets.detach().cpu().reshape(-1))
 
@@ -164,30 +240,40 @@ class KICMLightningModule(pl.LightningModule):
                 pass
 
     def on_test_epoch_end(self) -> None:
-        if not self.test_preds:
+        # S7-01 FIX: Always participate in all_gather collectives even with
+        # empty local data to prevent NCCL desync across DDP ranks.
+        local_preds = (
+            torch.cat(self.test_preds).float()
+            if self.test_preds
+            else torch.tensor([], dtype=torch.float32)
+        )
+        local_targets = (
+            torch.cat(self.test_targets).float()
+            if self.test_targets
+            else torch.tensor([], dtype=torch.float32)
+        )
+
+        all_preds = all_gather_tensors(local_preds).numpy()
+        all_targets = all_gather_tensors(local_targets).numpy()
+
+        self.test_preds.clear()
+        self.test_targets.clear()
+
+        if len(all_preds) < 2:
             return
-
-        local_preds = torch.cat(self.test_preds).float()
-        local_targets = torch.cat(self.test_targets).float()
-
-        gathered_preds = self.all_gather(local_preds)
-        gathered_targets = self.all_gather(local_targets)
-        all_preds = gathered_preds.reshape(-1).cpu().numpy()
-        all_targets = gathered_targets.reshape(-1).cpu().numpy()
 
         try:
             metrics = compute_metrics(all_preds, all_targets)
         except ValueError as exc:
             logger.warning("[KICMLightningModule] Could not compute test metrics: %s", exc)
-            self.test_preds.clear()
-            self.test_targets.clear()
             return
 
-        self.log("test/r2", metrics["r2"], sync_dist=False)
-        self.log("test/rmse", metrics["rmse"], sync_dist=False)
-        self.log("test/mae", metrics["mae"], sync_dist=False)
-        self.log("test/pcc", metrics["pearson"], sync_dist=False)
-        self.log("test/scc", metrics["spearman"], sync_dist=False)
+        # Metrics are computed on all-gathered data — identical on all ranks
+        self.log("test/r2", metrics["r2"])
+        self.log("test/rmse", metrics["rmse"])
+        self.log("test/mae", metrics["mae"])
+        self.log("test/pcc", metrics["pearson"])
+        self.log("test/scc", metrics["spearman"])
 
         logger.info(
             "[KICMLightningModule] test  r2=%.4f  rmse=%.4f  pcc=%.4f  scc=%.4f",
@@ -198,12 +284,8 @@ class KICMLightningModule(pl.LightningModule):
         if predictions_csv and self.global_rank == 0:
             self._save_predictions_csv(all_preds, predictions_csv)
 
-        self.test_preds.clear()
-        self.test_targets.clear()
-
     def _save_predictions_csv(self, preds: "np.ndarray", output_path: str) -> None:
         """Save test predictions merged with original test CSV for OOD eval."""
-        import numpy as np  # noqa: PLC0415
         from pathlib import Path  # noqa: PLC0415
         import pandas as pd  # noqa: PLC0415
 
@@ -221,8 +303,15 @@ class KICMLightningModule(pl.LightningModule):
         df = df[df[sequence_col].str.len() <= max_seq_len].copy()
 
         from rdkit import Chem  # noqa: PLC0415
+        from src.data.cofactor_registry import separate_reactants  # noqa: PLC0415
+
+        def _is_valid_smiles(raw_smiles: str) -> bool:
+            substrate_smiles, _, _ = separate_reactants(str(raw_smiles))
+            mol = Chem.MolFromSmiles(substrate_smiles)
+            return mol is not None
+
         valid_smiles = df[smiles_col].apply(
-            lambda s: isinstance(s, str) and s.strip() != "" and Chem.MolFromSmiles(s) is not None
+            lambda s: isinstance(s, str) and s.strip() != "" and _is_valid_smiles(s)
         )
         df = df[valid_smiles].reset_index(drop=True)
 
@@ -255,44 +344,63 @@ class KICMLightningModule(pl.LightningModule):
             return max(cosine, min_ratio)
         return lr_lambda
 
+    _NO_DECAY_NAME_PARTS = frozenset({
+        "norm", "norm1", "norm2", "ffn_norm", "input_norm",
+        "layernorm", "layer_norm", "batch_norm",
+        "protein_proj_norm",   # cross_attn.protein_proj_norm (S15-01 — Sequential decomposed)
+        "residual_norm",       # mlp_head.residual_norm (S15-02)
+    })
+
     @staticmethod
     def _is_no_decay_param(name: str) -> bool:
-        """Return True if parameter should be excluded from weight decay."""
+        """Return True if parameter should be excluded from weight decay.
+
+        Matches: bias parameters, and parameters belonging to normalization layers.
+        Uses exact part matching (split on '.') to avoid substring false positives.
+        """
         if name.endswith(".bias"):
             return True
         parts = name.split(".")
-        return any("norm" in part.lower() for part in parts)
+        return any(part in KICMLightningModule._NO_DECAY_NAME_PARTS for part in parts)
 
     def configure_optimizers(self) -> dict[str, Any]:
         train_cfg = self.config["training"]
         lr_cfg = train_cfg["lr"]
         wd = train_cfg["weight_decay"]
-
-        # LoRA adapters have no bias (bias="none" in LoraConfig)
-        # All LoRA params are 2D matrices — all go to decay group
-        lora_params = list(self.model.esm3_encoder.lora_parameters())
-        lora_ids = {id(p) for p in lora_params}
-
-        # Determine MoLFormer state
-        mol_frozen = self.model.substrate_encoder._frozen
         model_cfg = self.config.get("model", {})
-        mol_lora_enabled = model_cfg.get("molformer_lora", {}).get("enabled", False)
 
-        # Identify MoLFormer parameters (by id) for routing
-        molformer_param_ids = {id(p) for p in self.model.substrate_encoder.parameters()}
+        # ESM3 LoRA params (if enabled)
+        esm3_lora_enabled = model_cfg.get("esm3_lora", {}).get("enabled", False)
+        lora_params = []
+        lora_ids: set[int] = set()
+        if esm3_lora_enabled:
+            lora_params = list(self.model.esm3_encoder.lora_parameters())
+            lora_ids = {id(p) for p in lora_params}
+
+        # BioT5+ params (always trainable in Phase E)
+        biot5_param_ids = {id(p) for p in self.model.substrate_encoder.parameters()}
 
         task_decay, task_no_decay = [], []
-        molformer_decay, molformer_no_decay = [], []
-        molformer_lora_params: list = []
+        biot5_decay, biot5_no_decay = [], []
 
-        if mol_frozen and mol_lora_enabled:
-            # Frozen + LoRA: collect only LoRA (requires_grad=True) params
-            molformer_lora_params = list(
-                self.model.substrate_encoder.lora_parameters()
-            )
-            mol_lora_ids = {id(p) for p in molformer_lora_params}
-        else:
-            mol_lora_ids = set()
+        # Scalar Mix layer_weights: task-head-level param, NOT a pretrained weight.
+        # Must use lr.task (1.2e-4), not lr.esm3_lora (5e-6). (S13-02)
+        # Routed to task_no_decay — Softmax scale weights should not be L2-shrunk. (S15-03)
+        if (
+            hasattr(self.model.esm3_encoder, "layer_weights")
+            and self.model.esm3_encoder.layer_weights is not None
+        ):
+            task_no_decay.append(self.model.esm3_encoder.layer_weights)  # S15-03: no_decay
+            lora_ids.add(id(self.model.esm3_encoder.layer_weights))  # prevent duplicate group
+
+        # Condition embeddings for missing pH/temp: zero-init learned vectors.
+        # Exempt from weight decay — L2 would shrink them back to zero. (S15-03)
+        _cond = self.model.cond_encoder
+        for _attr in ("ph_unknown", "temp_unknown"):
+            if hasattr(_cond, _attr):
+                _p = getattr(_cond, _attr)
+                task_no_decay.append(_p)
+                lora_ids.add(id(_p))  # prevent duplicate routing in main loop
 
         for name, param in self.model.named_parameters():
             if not param.requires_grad:
@@ -300,14 +408,11 @@ class KICMLightningModule(pl.LightningModule):
             pid = id(param)
             if pid in lora_ids:
                 continue  # handled as esm3_lora group
-            if pid in mol_lora_ids:
-                continue  # handled as molformer_lora group
-            if pid in molformer_param_ids:
-                # Only reached when MoLFormer is fully trainable
+            if pid in biot5_param_ids:
                 if self._is_no_decay_param(name):
-                    molformer_no_decay.append(param)
+                    biot5_no_decay.append(param)
                 else:
-                    molformer_decay.append(param)
+                    biot5_decay.append(param)
             else:
                 if self._is_no_decay_param(name):
                     task_no_decay.append(param)
@@ -315,9 +420,9 @@ class KICMLightningModule(pl.LightningModule):
                     task_decay.append(param)
 
         lr_task = lr_cfg["task"]
-        lr_esm3_lora = lr_cfg["esm3_lora"]
+        lr_biot5 = lr_cfg["biot5"]
 
-        # Build param groups — only include non-empty groups (no dead code)
+        # Build param groups — only include non-empty groups
         param_groups = []
         if task_decay:
             param_groups.append(
@@ -327,30 +432,19 @@ class KICMLightningModule(pl.LightningModule):
             param_groups.append(
                 {"params": task_no_decay, "lr": lr_task, "weight_decay": 0.0, "name": "task_no_decay"},
             )
-
-        # MoLFormer groups: depends on state
-        if not mol_frozen:
-            # Fully trainable — original decay/no_decay groups
-            lr_molformer = lr_cfg["molformer"]
-            if molformer_decay:
-                param_groups.append(
-                    {"params": molformer_decay, "lr": lr_molformer, "weight_decay": wd, "name": "molformer_decay"},
-                )
-            if molformer_no_decay:
-                param_groups.append(
-                    {"params": molformer_no_decay, "lr": lr_molformer, "weight_decay": 0.0, "name": "molformer_no_decay"},
-                )
-        elif mol_lora_enabled and molformer_lora_params:
-            # Frozen + LoRA — single LoRA group
-            lr_mol_lora = lr_cfg["molformer_lora"]
+        if biot5_decay:
             param_groups.append(
-                {"params": molformer_lora_params, "lr": lr_mol_lora, "weight_decay": wd, "name": "molformer_lora"},
+                {"params": biot5_decay, "lr": lr_biot5, "weight_decay": wd, "name": "biot5_decay"},
             )
-        # else: frozen, no LoRA — no molformer groups at all (saves optimizer RAM)
-
-        if lora_params:
+        if biot5_no_decay:
             param_groups.append(
-                {"params": lora_params, "lr": lr_esm3_lora, "weight_decay": wd, "name": "esm3_lora"},
+                {"params": biot5_no_decay, "lr": lr_biot5, "weight_decay": 0.0, "name": "biot5_no_decay"},
+            )
+        if esm3_lora_enabled and lora_params:
+            lr_esm3_lora = lr_cfg["esm3_lora"]
+            param_groups.append(
+                {"params": lora_params,
+                 "lr": lr_esm3_lora, "weight_decay": wd, "name": "esm3_lora"},
             )
 
         # Summary log
@@ -367,19 +461,49 @@ class KICMLightningModule(pl.LightningModule):
         )
 
         total_steps = self.trainer.estimated_stepping_batches
-        warmup_steps = train_cfg["scheduler"]["warmup_steps"]
-        min_ratio = train_cfg["scheduler"]["min_lr_ratio"]
+        if total_steps == 0:
+            raise RuntimeError(
+                "estimated_stepping_batches=0: configure_optimizers must be called "
+                "during trainer.fit(), not standalone."
+            )
+        sched_cfg = train_cfg["scheduler"]
+        min_ratio = sched_cfg["min_lr_ratio"]
+        wu_task = sched_cfg["warmup_steps"]
+        wu_biot5 = sched_cfg.get("biot5_warmup_steps", wu_task)
 
-        lr_lambda = self._make_cosine_lambda(warmup_steps, total_steps, min_ratio)
-        scheduler = LambdaLR(
-            optimizer,
-            lr_lambda=[lr_lambda] * len(optimizer.param_groups),
+        task_lambda = self._make_cosine_lambda(wu_task, total_steps, min_ratio)
+        biot5_lambda = self._make_cosine_lambda(wu_biot5, total_steps, min_ratio)
+
+        # Build per-group lr_lambda list matching param_groups order
+        lr_lambdas = []
+        for pg in param_groups:
+            name = pg.get("name", "")
+            if name.startswith("biot5"):
+                lr_lambdas.append(biot5_lambda)
+            else:
+                lr_lambdas.append(task_lambda)
+
+        scheduler = LambdaLR(optimizer, lr_lambda=lr_lambdas)
+
+        # Log BioT5+ trainable param count
+        biot5_trainable = sum(
+            p.numel() for p in self.model.substrate_encoder.parameters()
+            if p.requires_grad
+        )
+        logger.info(
+            "[KICMLightningModule] BioT5+ trainable params: %.2fM", biot5_trainable / 1e6,
+        )
+
+        # Log total trainable param count
+        total_trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        logger.info(
+            "[KICMLightningModule] Total trainable params: %.2fM", total_trainable / 1e6,
         )
 
         logger.info(
-            "[KICMLightningModule] Optimizer: AdamW  total_steps=%d  warmup=%d  "
-            "groups=%s",
-            total_steps, warmup_steps, group_summary,
+            "[KICMLightningModule] Optimizer: AdamW  total_steps=%d  wu_task=%d  "
+            "wu_biot5=%d  groups=%s",
+            total_steps, wu_task, wu_biot5, group_summary,
         )
 
         return {
@@ -395,51 +519,100 @@ class KICMLightningModule(pl.LightningModule):
     # Gradient monitoring
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _compute_grad_norm(params) -> float:
+        """Compute L2 norm of gradients across all parameters."""
+        grads = [p.grad.detach().flatten() for p in params if p.grad is not None]
+        if not grads:
+            return 0.0
+        return torch.cat(grads).norm(2).item()
+
     def on_after_backward(self) -> None:
-        if self.global_step % 100 == 0:
-            for name, param in self.model.named_parameters():
-                if param.grad is not None and "lora" in name:
-                    self.log("grad_norm/esm3_lora", param.grad.norm().item(), on_step=True)
-                    break
+        # L-02: Gradient norms are rank-local. Values reflect rank-0 only
+        # (W&B logger is rank-0). For cross-rank gradient monitoring,
+        # enable DDP gradient hooks separately. Do NOT add sync_dist here.
+        if self.global_step % 100 != 0:
+            return
+
+        # BioT5+ grad norm
+        biot5_norm = self._compute_grad_norm(self.model.substrate_encoder.parameters())
+        self.log("grad_norm/biot5", biot5_norm, on_step=True, on_epoch=False)
+
+        # Task head grad norm — covers proj + CA + condition + MLP
+        task_params = (
+            list(self.model.substrate_proj.parameters())
+            + list(self.model.cross_attn.parameters())
+            + list(self.model.cond_encoder.parameters())
+            + list(self.model.mlp_head.parameters())
+        )
+        task_norm = self._compute_grad_norm(task_params)
+        self.log("grad_norm/task", task_norm, on_step=True, on_epoch=False)
+
+        # ESM3 LoRA grad norm (only when enabled)
+        if self.model._esm3_lora_enabled:
+            lora_norm = self._compute_grad_norm(self.model.esm3_encoder.lora_parameters())
+            self.log("grad_norm/esm3_lora", lora_norm, on_step=True, on_epoch=False)
 
     # ------------------------------------------------------------------
-    # GPU memory & LR logging
+    # GPU memory & epoch-level logging
     # ------------------------------------------------------------------
 
     def on_train_epoch_end(self) -> None:
         epoch = self.current_epoch
         optimizer = self.optimizers()
 
+        # Extract current LRs for banner (LearningRateMonitor handles W&B logging)
         lr_task = next(
             (pg["lr"] for pg in optimizer.param_groups if pg.get("name", "").startswith("task")),
+            0.0,
+        )
+        lr_biot5 = next(
+            (pg["lr"] for pg in optimizer.param_groups if pg.get("name", "").startswith("biot5")),
             0.0,
         )
         lr_esm3 = next(
             (pg["lr"] for pg in optimizer.param_groups if pg.get("name", "").startswith("esm3")),
             0.0,
         )
-        lr_molformer = next(
-            (pg["lr"] for pg in optimizer.param_groups if pg.get("name", "").startswith("molformer")),
-            0.0,
-        )
 
-        self.log("lr/task", lr_task, on_step=False, on_epoch=True)
-        self.log("lr/esm3_lora", lr_esm3, on_step=False, on_epoch=True)
-        self.log("lr/molformer", lr_molformer, on_step=False, on_epoch=True)
+        # Epoch-level condition coverage (accumulated via MeanMetric)
+        # MeanMetric.compute() with sync_on_compute=True all-reduces internally —
+        # do NOT add sync_dist=True here (would double-sync).
+        self.log("train/ph_coverage", self.ph_coverage_metric.compute(),
+                 on_step=False, on_epoch=True)
+        self.log("train/temp_coverage", self.temp_coverage_metric.compute(),
+                 on_step=False, on_epoch=True)
+        self.ph_coverage_metric.reset()
+        self.temp_coverage_metric.reset()
 
         if torch.cuda.is_available():
             mem_gb = torch.cuda.max_memory_allocated() / 1e9
-            self.log("gpu/memory_gb", mem_gb, sync_dist=True)
+            # Per-rank memory logging (L-01 / S10-09 / S10-11): sync_dist=False allows per-GPU visibility.
+            # Use rank-specific key so all GPUs are visible in W&B simultaneously.
+            # S10-11: sync_dist=True mean aggregate removed — ALLREDUCE immediately after
+            # MeanMetric's two ALLGATHER collectives (ph + temp coverage) caused SeqNum mismatch
+            # at Epoch 1 boundary (Rank 0 SeqNum=485 ALLREDUCE vs Rank 1 SeqNum=484 ALLGATHER).
+            self.log(f"gpu/memory_gb/rank{self.global_rank}", mem_gb, sync_dist=False)
+            logger.info(
+                "[GPU mem] rank=%d  peak=%.2fGB", self.global_rank, mem_gb,
+            )
             torch.cuda.reset_peak_memory_stats()
         else:
             mem_gb = 0.0
 
         print(
             f"=== Epoch {epoch} "
-            f"| lr_task={lr_task:.2e} | lr_mol={lr_molformer:.2e} "
+            f"| lr_task={lr_task:.2e} | lr_biot5={lr_biot5:.2e} "
             f"| lr_lora={lr_esm3:.2e} | GPU_mem={mem_gb:.1f}GB ==="
         )
         logger.info(
-            "=== Epoch %d | lr_task=%.2e | lr_mol=%.2e | lr_lora=%.2e | GPU_mem=%.1fGB ===",
-            epoch, lr_task, lr_molformer, lr_esm3, mem_gb,
+            "=== Epoch %d | lr_task=%.2e | lr_biot5=%.2e | lr_lora=%.2e | GPU_mem=%.1fGB ===",
+            epoch, lr_task, lr_biot5, lr_esm3, mem_gb,
         )
+
+        # Scalar Mix weights diagnostic (S12-02)
+        if hasattr(self.model.esm3_encoder, 'layer_weights'):
+            w = torch.softmax(self.model.esm3_encoder.layer_weights.detach(), dim=0)
+            for i, wi in enumerate(w.tolist()):
+                self.log(f"esm3/layer_weight_{i}", wi,
+                         on_epoch=True, sync_dist=False)  # diagnostic, rank-0 only

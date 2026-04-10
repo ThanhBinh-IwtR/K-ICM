@@ -1,17 +1,19 @@
 from src.models.esm3_encoder import ESM3Encoder
-from src.models.molformer_encoder import MoLFormerEncoder
+from src.models.biot5_encoder import BioT5PlusEncoder
 from src.models.cross_attention import CrossAttentionFusion
 from src.models.projection import ProjectionLayer
 from src.models.mlp_head import MLPHead
+from src.models.condition_encoder import ConditionEncoder
 from src.models.kicm_model import KICMModel
 from src.models.kicm_module import KICMLightningModule
 
 __all__ = [
     "ESM3Encoder",
-    "MoLFormerEncoder",
+    "BioT5PlusEncoder",
     "CrossAttentionFusion",
     "ProjectionLayer",
     "MLPHead",
+    "ConditionEncoder",
     "KICMModel",
     "KICMLightningModule",
 ]

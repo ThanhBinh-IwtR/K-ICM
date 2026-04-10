@@ -1,141 +1,124 @@
 # ============================================================
-# ESM3-MoLFormer D2 MolFrozen — Training Configuration
-# Hardware: 4× NVIDIA GPU, num_gpus=4
-# Date: 2026-03-31
-# Launch: CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 train.py --config configs/train_config.yaml
+# KICM Phase E — BioT5+ + Multi-Query CA + FiLM
+# Hardware: 4× NVIDIA L40S, num_gpus=4
+# Training: CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4
 # ============================================================
 
-# ---- Project -----------------------------------------------
 project:
-  name: "esm3-molformer-kcat-CA-MolLoRA"
+  name: "kicm-phase-e-biot5-mqca-film"
   seed: 42
   output_dir: "outputs/"
   checkpoint_dir: "outputs/checkpoints/"
   log_dir: "outputs/logs/"
 
-# ---- Data --------------------------------------------------
 data:
-  train_csv: "data/train.csv"
-  val_csv:   "data/val.csv"
-  test_csv:  "data/test.csv"
+  train_csv:       "data/train.csv"
+  val_csv:         "data/val.csv"
+  test_csv:        "data/test.csv"
   predictions_csv: "outputs/test_predictions.csv"
-  sequence_col: "sequence"
-  smiles_col:   "reactant_smiles"
-  target_col:   "log10_value"
-  max_seq_len:  1024
-  num_workers:  4
-  pin_memory:   true
+  sequence_col:    "sequence"
+  smiles_col:      "reactant_smiles"
+  target_col:      "log10_value"
+  ph_col:          "ph"
+  temp_col:        "temperature"
+  max_seq_len:     1024
+  num_workers:     4
+  pin_memory:      true
 
-# ---- Model -------------------------------------------------
 model:
-  esm3_variant:   "esm3_sm_open_v1"
-  d_esm3:         1536
-  substrate_encoder: "molformer"
-  d_substrate:    768
-  d_proj:         512
-  d_fusion:       512
+  esm3_variant: "esm3_sm_open_v1"
+  d_esm3:       1536
 
-  molformer_model: "ibm/MoLFormer-XL-both-10pct"
-  molformer_max_length: 202
-  molformer_use_pooler: true
-
-  molformer_frozen: true
-
-  molformer_lora:
-    enabled:        true        # set true in experiment 2, do not change now
-    r:              12
+  esm3_lora:
+    enabled:        true
+    r:              8
     alpha:          16
     dropout:        0.05
-    target_modules: ["attention.self.query",
-      "attention.self.key",
-      "attention.self.value",
-      "attention.output.dense",
-      "intermediate.dense",
-      "output.dense"]           # fill after named_modules scan, leave empty for now
+    target_modules: ["layernorm_qkv.1", "output_projection", "ffn.1"]
+
+  substrate_encoder: "biot5"
+  biot5_model:       "QizhiPei/biot5-plus-base"
+  biot5_max_length:  192
+  d_substrate:       768
+
+  biot5_lora:
+    enabled:         true
+    r:               16
+    alpha:           32
+    dropout:         0.05    # M-02: added Session 9; matches esm3_lora dropout for consistency
+    target_modules:  ["q", "k", "v", "o", "wi", "wo"]
+  d_proj:            512
+  d_fusion:          512
+  d_cond:            256
 
   projection_normalize_input: true
 
-  esm3_lora:
-    r:              12
-    alpha:          24
-    dropout:        0.05
-    target_modules: ["layernorm_qkv.1", "output_projection", "ffn.1"]   # verified from named_modules scan
-
   cross_attention:
-    d_sub:          512
-    d_prot:         1536
-    n_heads:        8
-    dropout:        0.1
+    d_sub:   512
+    d_prot:  1536
+    n_heads: 8
+    dropout: 0.1
 
   mlp:
-    hidden_dims:  [512, 256, 128]
-    dropouts:     [0.2, 0.1, 0.0]
-    activation:   "gelu"
+    hidden_dims: [512, 256, 128]
+    dropouts:    [0.3, 0.2, 0.1]
+    activation:  "gelu"
 
-# ---- Training ----------------------------------------------
 training:
-  num_gpus:       2
-  ddp_backend:    "nccl"
-  precision:      "bf16-mixed"
+  num_gpus:    4
+  ddp_backend: "nccl"
+  precision:   "bf16-mixed"
   find_unused_parameters: false
 
   batch_size_per_gpu:          2
-  gradient_accumulation_steps: 128
-  effective_batch_size:        256
+  gradient_accumulation_steps: 16
+  effective_batch_size:        128   # 4 × 2 × 16 = 128
 
-  max_epochs:           100
-  val_every_n_epochs:   1
+  max_epochs:         200
+  val_every_n_epochs: 1
 
-  loss:        "huber"
-  huber_beta:  1.0
+  loss:       "huber_delta4"
+  huber_beta: 1.0
 
   gradient_clip_norm: 1.0
 
   lr:
-    task:          2.0e-4
-    molformer:   5.0e-5    # irrelevant while molformer_frozen: true
-    esm3_lora:     7.0e-6
-    molformer_lora: 5.0e-5   # only used when molformer_lora.enabled is true
+    task:       1.2e-4
+    biot5:      1.5e-5
+    esm3_lora:  5.0e-6
 
-  weight_decay:    1.0e-2
-  adam_eps:        1.0e-8
-  adam_betas:      [0.9, 0.999]
+  weight_decay: 1.5e-2
+  adam_eps:     1.0e-8
+  adam_betas:   [0.9, 0.999]
 
   scheduler:
-    warmup_steps:        100    # Reduced since MoLFormer removed from optimizer
-    min_lr_ratio:        0.01
+    warmup_steps:       500
+    biot5_warmup_steps: 1000
+    min_lr_ratio:       0.05
 
   early_stopping:
-    monitor:    "val/r2"
-    mode:       "max"
-    patience:   20
-    min_delta:  0.001
+    monitor:   "val/r2"
+    mode:      "max"
+    patience:  30
+    min_delta: 0.001
 
   checkpoint:
-    save_top_k:   3
-    monitor:      "val/r2"
-    mode:         "max"
-    filename:     "epoch{epoch:03d}-r2{val/r2:.4f}"
+    save_top_k: 3
+    monitor:    "val/r2"
+    mode:       "max"
+    filename:   "epoch{epoch:03d}-r2{val/r2:.4f}"
 
-# ---- Logging -----------------------------------------------
 logging:
-  backend:       "wandb"
-  wandb_project: "kcat-prediction"
-  wandb_entity:  null
+  backend:           "wandb"
+  wandb_project:     "kcat-prediction"
+  wandb_entity:      null
   log_every_n_steps: 10
   log_gpu_memory:    true
 
-# ---- Evaluation --------------------------------------------
 evaluation:
-  metrics:
-    - "r2"
-    - "rmse"
-    - "mae"
-    - "spearman"
-    - "pearson"
+  metrics:        ["r2", "rmse", "mae", "spearman", "pearson"]
   primary_metric: "r2"
 
-# ---- Reproducibility ----------------------------------------
 reproducibility:
   deterministic: false
   benchmark:     false

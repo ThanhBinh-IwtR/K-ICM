@@ -41,9 +41,9 @@ class MLPHead(nn.Module):
 
     Architecture (from config, d_in=512):
         LayerNorm(d_in=512)
-        Linear(512, 512) → GELU → Dropout(0.2) + residual + LayerNorm
-        Linear(512, 256)  → GELU → Dropout(0.1)
-        Linear(256, 128)  → GELU
+        Linear(512, 512) → GELU → Dropout(0.3) + residual + LayerNorm
+        Linear(512, 256)  → GELU → Dropout(0.2)
+        Linear(256, 128)  → GELU → Dropout(0.1)
         Linear(128, 1)
 
     When d_in == hidden_dims[0], a residual connection is added around the
@@ -78,8 +78,6 @@ class MLPHead(nn.Module):
                 f"len(dropouts)={len(dropouts)} must equal "
                 f"len(hidden_dims)={len(hidden_dims)}"
             )
-
-        act_fn = _get_activation(activation)
 
         # Input normalization
         self.input_norm = nn.LayerNorm(d_in)
@@ -119,6 +117,33 @@ class MLPHead(nn.Module):
             self.use_residual,
         )
 
+    def forward_hidden(self, x: Tensor) -> Tensor:
+        """Run all hidden layers, return intermediate representation.
+
+        Args:
+            x: FloatTensor [B, d_in].
+
+        Returns:
+            FloatTensor [B, hidden_dims[-1]] — hidden representation before output linear.
+        """
+        x = self.input_norm(x)
+        h = self.layer0(x)
+        if self.use_residual:
+            h = self.residual_norm(x + h)
+        h = self.remaining(h)
+        return h
+
+    def forward_output(self, h: Tensor) -> Tensor:
+        """Apply final output linear to hidden representation.
+
+        Args:
+            h: FloatTensor [B, hidden_dims[-1]].
+
+        Returns:
+            FloatTensor [B] — scalar predictions.
+        """
+        return self.out(h).squeeze(-1)  # [B, 1] → [B]
+
     def forward(self, x: Tensor) -> Tensor:
         """Predict log10(kcat) from fused embedding.
 
@@ -128,12 +153,7 @@ class MLPHead(nn.Module):
         Returns:
             FloatTensor [B] — scalar predictions (not [B, 1]).
         """
-        x = self.input_norm(x)
-        h = self.layer0(x)
-        if self.use_residual:
-            h = self.residual_norm(x + h)
-        h = self.remaining(h)
-        return self.out(h).squeeze(-1)  # [B, 1] → [B]
+        return self.forward_output(self.forward_hidden(x))
 
 
 # ---------------------------------------------------------------------------

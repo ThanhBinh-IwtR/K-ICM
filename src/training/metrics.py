@@ -98,7 +98,7 @@ def all_gather_tensors(
     On single-process runs (no distributed context), returns the input as-is.
 
     Args:
-        local_tensor: 1-D FloatTensor on the local rank's device.
+        local_tensor: 1-D FloatTensor (CPU or GPU).
 
     Returns:
         Concatenated 1-D FloatTensor on CPU containing all ranks' values.
@@ -110,17 +110,21 @@ def all_gather_tensors(
     if world_size == 1:
         return local_tensor.detach().cpu()
 
+    # NCCL requires GPU tensors — move to current rank's device if on CPU
+    device = torch.device(f"cuda:{dist.get_rank() % torch.cuda.device_count()}")
+    local_tensor = local_tensor.detach().to(device)
+
     # All ranks must share their tensor sizes before gathering.
     local_size = torch.tensor(
-        [local_tensor.numel()], dtype=torch.long, device=local_tensor.device
+        [local_tensor.numel()], dtype=torch.long, device=device
     )
     all_sizes = [torch.zeros_like(local_size) for _ in range(world_size)]
     dist.all_gather(all_sizes, local_size)
 
     max_size = max(s.item() for s in all_sizes)
     # Pad local tensor to max_size so all_gather can use a fixed-length buffer
-    padded = torch.zeros(max_size, dtype=local_tensor.dtype, device=local_tensor.device)
-    padded[: local_tensor.numel()] = local_tensor.detach()
+    padded = torch.zeros(max_size, dtype=local_tensor.dtype, device=device)
+    padded[: local_tensor.numel()] = local_tensor
 
     gathered = [torch.zeros_like(padded) for _ in range(world_size)]
     dist.all_gather(gathered, padded)

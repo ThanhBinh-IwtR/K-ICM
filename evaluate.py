@@ -266,7 +266,7 @@ def evaluate(
     with torch.no_grad():
         for batch in loader:
             tokens = batch["sequence_tokens"].to(device)
-            padding_mask = batch["padding_mask"].to(device)
+            esm_pad_mask = batch["esm_pad_mask"].to(device)
             smiles = batch["smiles"]
             targets = batch["targets"]  # [B] — collator now produces 1-D tensors
 
@@ -275,7 +275,7 @@ def evaluate(
                 dtype=torch.bfloat16,
                 enabled=(device.type == "cuda"),
             ):
-                preds = model(tokens, padding_mask, smiles)
+                preds = model(tokens, esm_pad_mask, smiles)
 
             all_preds.append(preds.detach().cpu())
             all_targets.append(targets)

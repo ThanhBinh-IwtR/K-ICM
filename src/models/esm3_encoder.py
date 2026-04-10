@@ -6,7 +6,9 @@ Uses EvolutionaryScale ESM-3 (esm==3.2.3):
     Layers:   48 transformer blocks (model.transformer.blocks)
     Hook:     model.transformer.blocks[-1] — last block
 
-D2 LoRA: ESM-3 backbone is frozen; only LoRA adapters (via PEFT) are trainable.
+Single last-layer hook captures the most refined, highest-level
+representation from the final transformer block. ESM-3 is frozen.
+
 The tokenizer (EsmSequenceTokenizer) is intentionally excluded from this module.
 The collator is responsible for tokenisation; this encoder receives pre-tokenised
 sequence_tokens [B, L].
@@ -14,7 +16,6 @@ sequence_tokens [B, L].
 from __future__ import annotations
 
 import logging
-from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -46,7 +47,7 @@ class ESM3Encoder(nn.Module):
         d_model: Hidden dimension. Default: 1536 (ESM-3 small).
 
     Component Contracts:
-        forward(sequence_tokens [B,L], padding_mask [B,L]) -> (hidden [B,L,1536], padding_mask [B,L])
+        forward(sequence_tokens [B,L], esm_pad_mask [B,L]) -> (hidden [B,L,1536], esm_pad_mask [B,L])
         freeze() — freeze all ESM-3 parameters
         apply_lora(r, alpha, dropout, target_modules) — wrap ESM-3 with LoRA adapters
         lora_parameters() — yield only LoRA adapter parameters
@@ -64,35 +65,30 @@ class ESM3Encoder(nn.Module):
         self.esm3: ESM3 = ESM3.from_pretrained(model_name)
         self.d_model: int = d_model
 
-        # Last-layer hidden states captured by forward hook
-        self._penultimate_hidden: Optional[Tensor] = None
-        self._hook = self.esm3.transformer.blocks[-1].register_forward_hook(
-            self._capture_penultimate
-        )
+        # Multi-scale hooks on last 4 transformer blocks, averaged for OOD generalization.
+        # ESM-3 is frozen → zero VRAM cost (no gradients through hooked blocks).
+        self._hidden_states: dict[int, Tensor] = {}
+        self._hooks: list = []
+
+        # Scalar Mix weights for 4 multi-scale hooks (S12-02)
+        # Initialized to zeros → softmax gives uniform 0.25 per layer at start
+        # Equivalent to current mean() — model learns optimal weights during training
+        self.layer_weights = nn.Parameter(torch.zeros(4))
+
+        for hook_idx in [-4, -3, -2, -1]:
+            block = self.esm3.transformer.blocks[hook_idx]
+
+            def _make_hook(idx: int):
+                return lambda m, inp, out: self._hidden_states.__setitem__(idx, out)
+
+            self._hooks.append(block.register_forward_hook(_make_hook(hook_idx)))
 
         logger.info(
-            "[ESM3Encoder] Loaded %s  d_model=%d  n_layers=%d  hook on block[-1]",
+            "[ESM3Encoder] Loaded %s  d_model=%d  n_layers=%d  hooks on blocks[-4:] (multi-scale)",
             model_name,
             d_model,
             len(self.esm3.transformer.blocks),
         )
-
-    # ------------------------------------------------------------------
-    # Hook
-    # ------------------------------------------------------------------
-
-    def _capture_penultimate(
-        self,
-        module: nn.Module,  # noqa: ARG002
-        input: tuple,       # noqa: ARG002
-        output: Tensor,
-    ) -> None:
-        """Forward hook: store penultimate block output.
-
-        ESM-3 transformer blocks return a single Tensor [B, L, D],
-        not a tuple — capture it directly.
-        """
-        self._penultimate_hidden = output
 
     # ------------------------------------------------------------------
     # Forward
@@ -101,55 +97,64 @@ class ESM3Encoder(nn.Module):
     def forward(
         self,
         sequence_tokens: Tensor,
-        padding_mask: Tensor,
+        esm_pad_mask: Tensor,
     ) -> tuple[Tensor, Tensor]:
-        """Run ESM-3 and return penultimate-layer hidden states.
+        """Run ESM-3 and return multi-scale averaged hidden states.
+
+        Averages the outputs of the last 4 transformer blocks for better
+        OOD generalization. Zero VRAM cost since ESM-3 is frozen.
+
+        Mask convention (M-01):
+            esm_pad_mask: [B, L] bool, True = PADDING position
 
         Args:
             sequence_tokens: LongTensor [B, L] — pre-tokenised sequences
                 (BOS and EOS added by EsmSequenceTokenizer in the collator).
-            padding_mask: BoolTensor [B, L] — True at padding positions
+            esm_pad_mask: BoolTensor [B, L] — True at padding positions
                 (derived from attention_mask == 0 in the collator).
 
         Returns:
             Tuple of:
-                hidden — FloatTensor [B, L, d_model] from penultimate block
-                padding_mask — BoolTensor [B, L] (passed through unchanged)
+                hidden — FloatTensor [B, L, d_model] averaged from blocks[-4:]
+                esm_pad_mask — BoolTensor [B, L] (passed through unchanged)
         """
-        self._penultimate_hidden = None
+        self._hidden_states.clear()
 
-        # Move inputs to ESM-3 device (auto-loads to CUDA if available)
         _esm_device = next(self.esm3.parameters()).device
         _input_device = sequence_tokens.device
         sequence_tokens = sequence_tokens.to(_esm_device)
 
-        # ESM-3 loads as bfloat16 on CUDA but internally creates some intermediate
-        # tensors (average_plddt) as float32 — autocast resolves the dtype mismatch.
-        # On CPU (float32 model) autocast is a no-op.
-        _autocast_device = _esm_device.type  # "cuda" or "cpu"
+        _autocast_device = _esm_device.type
         with torch.autocast(_autocast_device, dtype=torch.bfloat16, enabled=(_esm_device.type == "cuda")):
             _ = self.esm3(sequence_tokens=sequence_tokens)
 
-        if self._penultimate_hidden is None:
+        if len(self._hidden_states) != 4:
             raise RuntimeError(
-                "[ESM3Encoder] Last-layer hook did not fire. "
-                "Check that model.transformer.blocks[-1] exists."
+                f"[ESM3Encoder] Expected 4 hook outputs, got {len(self._hidden_states)}. "
+                "Check that model.transformer.blocks[-4:] exist."
             )
 
-        # Cast to float32 and move back to the caller's device so downstream
-        # modules (AttentivePooling, projections) don't hit device mismatches.
-        hidden = self._penultimate_hidden.float().to(_input_device)  # [B, L, d_model]
-        return hidden, padding_mask
+        # Scalar Mix: learned weighted combination of 4 ESM-3 layers (S12-02)
+        # softmax ensures weights sum to 1 and are always positive.
+        # OUTSIDE autocast: layer_weights are float32; cast each hidden state to
+        # float32 before weighting to avoid bfloat16 precision loss. (S13-03)
+        weights = torch.softmax(self.layer_weights, dim=0)  # [4] float32
+        hidden = sum(
+            weights[i] * self._hidden_states[k].float()
+            for i, k in enumerate([-4, -3, -2, -1])
+        )
+        return hidden.float().to(_input_device), esm_pad_mask
 
     # ------------------------------------------------------------------
     # Freezing & LoRA
     # ------------------------------------------------------------------
 
     def freeze(self) -> None:
-        """Freeze all ESM-3 parameters."""
+        """Freeze all ESM-3 parameters and set eval mode."""
         for p in self.esm3.parameters():
             p.requires_grad_(False)
-        logger.info("[ESM3Encoder] All parameters frozen.")
+        self.esm3.eval()
+        logger.info("[ESM3Encoder] All parameters frozen, model set to eval() mode.")
 
     def apply_lora(
         self,
@@ -196,10 +201,18 @@ class ESM3Encoder(nn.Module):
             if param.requires_grad:
                 yield param
 
-    def __del__(self) -> None:
-        """Remove the forward hook when the encoder is garbage-collected."""
-        if hasattr(self, "_hook"):
-            self._hook.remove()
+    def remove_hooks(self) -> None:
+        """Explicitly remove all forward hooks. Call before model deletion or reuse."""
+        for hook in self._hooks:
+            hook.remove()
+        self._hooks.clear()
+        self._hidden_states.clear()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.remove_hooks()
 
 
 # ---------------------------------------------------------------------------
@@ -212,14 +225,14 @@ if __name__ == "__main__":
     _logging.basicConfig(level=_logging.INFO)
 
     enc = ESM3Encoder()
-
     enc.freeze()
+
+    # Verify 4 multi-scale hooks registered
+    assert len(enc._hooks) == 4, f"Expected 4 hooks, got {len(enc._hooks)}"
+    print(f"Multi-scale hooks registered: {len(enc._hooks)} ✓")
+
+    # Apply LoRA and verify
     enc.apply_lora(r=16, alpha=32, dropout=0.05)
-
-    # Verify hook survived PEFT wrapping
-    assert enc._penultimate_hidden is None, "Hook buffer should be None before forward"
-
-    # Verify LoRA parameters are trainable
     lora_params = list(enc.lora_parameters())
     assert len(lora_params) > 0, "No LoRA parameters found"
     print(f"LoRA trainable params: {sum(p.numel() for p in lora_params)}")
@@ -229,12 +242,11 @@ if __name__ == "__main__":
 
     B, L = 2, 50
     tokens = torch.randint(0, 32, (B, L), device=_device)
-    padding_mask = torch.zeros(B, L, dtype=torch.bool, device=_device)
+    esm_pad_mask = torch.zeros(B, L, dtype=torch.bool, device=_device)
 
     with torch.no_grad():
-        hidden, mask = enc(tokens, padding_mask)
+        hidden, mask = enc(tokens, esm_pad_mask)
 
     print(f"hidden shape: {hidden.shape}")   # [2, 50, 1536]
-
     assert hidden.shape == (B, L, enc.d_model), f"Unexpected hidden shape: {hidden.shape}"
-    print("esm3_encoder.py smoke test PASSED (LoRA + hook survival verified)")
+    print("esm3_encoder.py smoke test PASSED (multi-scale hooks + LoRA verified)")
