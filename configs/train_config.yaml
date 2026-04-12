@@ -22,6 +22,8 @@ data:
   sequence_col: "sequence"
   smiles_col:   "reactant_smiles"
   target_col:   "log10_value"
+  ph_col:       "ph"
+  temp_col:     "temperature"
   max_seq_len:  1024
   num_workers:  4
   pin_memory:   true
@@ -59,7 +61,7 @@ model:
     r:              12
     alpha:          24
     dropout:        0.05
-    target_modules: ["layernorm_qkv.1", "output_projection", "ffn.1"]   # verified from named_modules scan
+    target_modules: ["layernorm_qkv.1", "out_proj", "ffn.1"]   # verified nn.Linear from named_modules scan
 
   cross_attention:
     d_sub:          512
@@ -72,6 +74,11 @@ model:
     dropouts:     [0.2, 0.1, 0.0]
     activation:   "gelu"
 
+# ---- Conditioning (FiLM pH/Temperature) ----------------------------
+conditioning:
+  d_cond:       64    # dimension of condition vector fed to FiLMLayer
+  d_mlp_hidden: 32    # hidden dim of pH/temp scalar embedding MLPs
+
 # ---- Training ----------------------------------------------
 training:
   num_gpus:       2
@@ -80,8 +87,8 @@ training:
   find_unused_parameters: false
 
   batch_size_per_gpu:          2
-  gradient_accumulation_steps: 128
-  effective_batch_size:        256
+  gradient_accumulation_steps: 64
+  effective_batch_size:        128
 
   max_epochs:           100
   val_every_n_epochs:   1
@@ -108,7 +115,7 @@ training:
   early_stopping:
     monitor:    "val/r2"
     mode:       "max"
-    patience:   20
+    patience:   15
     min_delta:  0.001
 
   checkpoint:

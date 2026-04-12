@@ -170,7 +170,7 @@ class ESM3Encoder(nn.Module):
             target_modules: Linear layer names to adapt. Default: ["q_proj", "v_proj"].
         """
         if target_modules is None:
-            target_modules = ["layernorm_qkv.1"]  # verified from named_modules scan
+            target_modules = ["layernorm_qkv.1", "out_proj", "ffn.1"]  # verified nn.Linear from named_modules scan
 
         lora_config = LoraConfig(
             r=r,
@@ -183,6 +183,11 @@ class ESM3Encoder(nn.Module):
 
         n_lora = sum(p.numel() for p in self.esm3.parameters() if p.requires_grad)
         n_total = sum(p.numel() for p in self.esm3.parameters())
+
+        # Verify all LoRA-targeted params are 2D weight matrices (not vectors/scalars)
+        lora_params = [p for p in self.esm3.parameters() if p.requires_grad]
+        assert all(p.dim() == 2 for p in lora_params), "LoRA applied to non-matrix"
+
         logger.info(
             "[ESM3Encoder] LoRA applied: r=%d alpha=%d dropout=%.2f targets=%s  "
             "trainable=%d / %d (%.2f%%)",

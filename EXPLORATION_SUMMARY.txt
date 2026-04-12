@@ -1,0 +1,389 @@
+╔════════════════════════════════════════════════════════════════════════════╗
+║                   DATA PIPELINE EXPLORATION SUMMARY                       ║
+║                                                                            ║
+║  Project: Kcat Predictor (pH/Temperature FiLM Conditioning)              ║
+║  Branch: binhpht/feat/esm3-molformer-kcat-CA-LoRA                        ║
+║  Date: 2026-04-07                                                        ║
+╚════════════════════════════════════════════════════════════════════════════╝
+
+
+🎯 OBJECTIVE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Add pH and temperature conditioning using FiLM (Feature-wise Linear Modulation)
+to the kcat predictor model while gracefully handling missing condition values
+in the dataset.
+
+
+📊 MISSING VALUE ANALYSIS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+CRITICAL FINDING: Missing data is SPARSE AND RANDOM
+
+Training Data (18,751 samples):
+  ✅ Both pH and Temperature present: 17,693 samples (94.36%)
+  ⚠️  pH missing: 594 samples (3.17%)
+  ⚠️  Temperature missing: 708 samples (3.78%)
+  ⚠️  Neither pH nor Temperature: 244 samples (1.30%)
+
+Test Data (2,316 samples):
+  ✅ Both present: ~2,160 (93%)
+  ⚠️  pH missing: 69 (2.98%)
+  ⚠️  Temperature missing: 87 (3.76%)
+
+Validation Data (2,084 samples):
+  ✅ Both present: ~2,012 (96.5%)
+  ⚠️  pH missing: 72 (3.45%)
+  ⚠️  Temperature missing: 79 (3.79%)
+
+IMPLICATION: The model must learn from 94% of samples WITH conditions,
+while remaining robust for ~244 samples WITH NO conditions.
+
+
+✅ DATA PIPELINE STATUS: 80% COMPLETE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+ALREADY IMPLEMENTED:
+
+1. ✅ Dataset Reading (src/data/dataset.py, L130-136)
+   • Reads pH and temperature columns from CSV
+   • Handles NaN values gracefully
+   • Stores as list[float] with NaN for missing values
+
+2. ✅ Missing Value Detection (src/data/dataset.py, L160-175)
+   • KICMSample TypedDict includes 8 fields:
+     - ph: float
+     - temp: float
+     - ph_known: bool (tracks if value is known)
+     - temp_known: bool (tracks if value is known)
+   • Uses math.isnan() to detect missing values
+   • Sets placeholder value 0.0 for missing conditions
+
+3. ✅ Batch Construction (src/data/collator.py, L91-95, L169-180)
+   • Collator extracts conditions from all samples in batch
+   • Creates tensors:
+     - ph: [B] float
+     - temp: [B] float
+     - ph_known: [B] bool
+     - temp_known: [B] bool
+   • Ready to pass to model!
+
+4. ✅ Data Module Setup (src/data/kicm_datamodule.py)
+   • Reads ph_col and temp_col from config
+   • Passes to KICMDataset constructor
+   • Applies to all train/val/test splits
+
+
+NOT YET IMPLEMENTED:
+
+5. ❌ Configuration (configs/train_config.yaml)
+   🚨 CRITICAL BUG: Missing ph_col and temp_col entries!
+   • Will cause KeyError at training initialization
+   • Must add:
+       data:
+         ph_col: "ph"
+         temp_col: "temperature"
+
+6. ❌ Model Integration (src/models/kicm_model.py, L132-164)
+   • forward() doesn't accept condition parameters
+   • Must be modified to accept:
+     - ph: Tensor [B]
+     - temp: Tensor [B]
+     - ph_known: Tensor [B] bool
+     - temp_known: Tensor [B] bool
+
+7. ❌ FiLM Module (NEW FILE: src/models/film.py)
+   • Doesn't exist yet
+   • Must implement:
+     - FiLMLayer class
+     - ConditionEncoder class
+     - Handles known/unknown flags
+
+8. ❌ Training Integration (src/models/kicm_module.py, L72-85)
+   • training_step() doesn't extract conditions from batch
+   • Must extract and pass to model.forward()
+   • Same for validation_step() and test_step()
+
+
+📋 DETAILED FINDINGS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. CSV COLUMNS (43 total)
+   ✅ Required: sequence, reactant_smiles, log10_value
+   ✅ Present: temperature (0.0-105.0), ph (1.0-11.5)
+   ✅ Other: uniprot, ec, taxonomy_id, clustering info
+
+2. DATASET CLASS (KICMDataset)
+   Location: src/data/dataset.py
+   Responsibilities:
+   • Load CSV
+   • Drop rows with NaN in required columns
+   • Filter sequences > max_seq_len
+   • Filter invalid SMILES
+   • Track pH/temp NaN status
+   
+   Output per sample (KICMSample TypedDict):
+   • sequence: str
+   • smiles: str
+   • target: torch.Tensor (scalar)
+   • ph: float (0.0 if unknown)
+   • temp: float (0.0 if unknown)
+   • ph_known: bool ⭐
+   • temp_known: bool ⭐
+   • cofactor_fp: torch.Tensor [512]
+
+3. COLLATOR CLASS (KICMCollator)
+   Location: src/data/collator.py
+   Responsibilities:
+   • Tokenize sequences with ESM-3 EsmSequenceTokenizer
+   • Tokenize SMILES with BioT5+ tokenizer
+   • Separate cofactors and compute fingerprints
+   • Stack all batch data into tensors
+   
+   Output batch dict (10 keys):
+   • sequence_tokens: [B, L_max]
+   • esm_pad_mask: [B, L_max]
+   • biot5_input_ids: [B, S]
+   • biot5_attention_mask: [B, S]
+   • targets: [B]
+   • ph: [B] ⭐
+   • temp: [B] ⭐
+   • ph_known: [B] bool ⭐
+   • temp_known: [B] bool ⭐
+   • cofactor_fp: [B, 512]
+
+4. MODEL ARCHITECTURE (D2 LoRA)
+   Location: src/models/kicm_model.py
+   Components:
+   • ESM3Encoder (frozen + LoRA): 1536 dims
+   • MoLFormerEncoder (trainable + optional LoRA): 768 dims
+   • ProjectionLayer: 768 → 512
+   • CrossAttentionFusion (B1 unidirectional): 512 dims
+   • MLPHead: 512 → 256 → 128 → 1
+   
+   Current forward() signature:
+     forward(sequence_tokens, padding_mask, smiles_list) → [B]
+   
+   Missing parameters (needed for FiLM):
+     ph: Tensor [B]
+     temp: Tensor [B]
+     ph_known: Tensor [B] bool
+     temp_known: Tensor [B] bool
+
+5. TRAINING LOOP (Lightning)
+   Location: src/models/kicm_module.py
+   Current training_step() extracts:
+   • sequence_tokens
+   • padding_mask
+   • smiles_list
+   • targets
+   
+   Missing: ph, temp, ph_known, temp_known
+   
+   Loss: SmoothL1Loss (Huber loss)
+   Optimizer: AdamW with 5 parameter groups
+
+
+🚨 IDENTIFIED BUGS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+BUG #1: Missing Config Keys
+  File: configs/train_config.yaml
+  Severity: CRITICAL (will crash at training)
+  Details:
+    • data section missing ph_col and temp_col entries
+    • src/data/kicm_datamodule.py tries to access them directly
+    • Will raise KeyError when training starts
+  Fix:
+    data:
+      ...
+      ph_col: "ph"
+      temp_col: "temperature"
+
+BUG #2: No Default Fallback in DataModule
+  File: src/data/kicm_datamodule.py (L68-69)
+  Severity: MEDIUM (creates hard failure)
+  Details:
+    • Uses data_cfg["ph_col"] instead of data_cfg.get("ph_col", "ph")
+    • No fallback if config missing these keys
+  Fix: Change to:
+    ph_col = data_cfg.get("ph_col", "ph")
+    temp_col = data_cfg.get("temp_col", "temperature")
+
+
+💡 RECOMMENDED SOLUTION: MASKING STRATEGY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+For samples with missing condition values:
+
+1. Data Pipeline (already done!)
+   • Set condition value to 0.0 (placeholder)
+   • Set _known flag to False
+   • Include sample in training (no data loss)
+
+2. FiLM Layer (to implement)
+   • Encode pH and temperature to FiLM parameters (gamma, beta)
+   • Check ph_known and temp_known flags
+   • If not known: use identity transform (gamma=1.0, beta=0.0)
+   • Otherwise: apply learned modulation
+
+3. Training (to implement)
+   • Model learns to use conditions when available
+   • Model learns to ignore conditions when unavailable
+   • Natural regularization: 6-10% of data forces robustness
+
+4. Inference (automatic)
+   • If test sample missing condition: identity transform applied
+   • Model makes prediction based on other features
+   • No special handling needed
+
+
+🔧 IMPLEMENTATION CHECKLIST
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+PHASE 1: Fix Blocking Bugs
+  [ ] Add ph_col, temp_col to configs/train_config.yaml
+  [ ] Add .get() defaults to src/data/kicm_datamodule.py
+  [ ] Test with smoke_test.py
+
+PHASE 2: Create FiLM Module
+  [ ] Create src/models/film.py
+  [ ] Implement FiLMLayer (d_features → modulated output)
+  [ ] Implement ConditionEncoder (conditions → gamma, beta)
+  [ ] Handle known/unknown flags
+  [ ] Add smoke tests
+
+PHASE 3: Integrate FiLM into Model
+  [ ] Modify KICMModel.__init__() to create FiLMLayer
+  [ ] Modify KICMModel.forward() signature to accept conditions
+  [ ] Insert FiLM after cross_attn, before mlp_head
+  [ ] Test forward pass
+
+PHASE 4: Wire into Training
+  [ ] Modify KICMLightningModule.training_step()
+  [ ] Extract ph, temp, ph_known, temp_known from batch
+  [ ] Pass to self.model()
+  [ ] Update validation_step() and test_step() similarly
+
+PHASE 5: Configuration
+  [ ] Update configs/train_config.yaml with FiLM section:
+      model:
+        film:
+          enabled: true
+          d_features: 512
+          n_conditions: 2
+
+PHASE 6: Testing & Validation
+  [ ] Add FiLM tests to smoke_test.py
+  [ ] Test with all conditions known
+  [ ] Test with some conditions unknown
+  [ ] Test with no conditions known
+  [ ] Verify gradients flow through FiLM
+  [ ] Run full training pipeline
+
+
+📁 KEY FILES & LINE NUMBERS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Data Pipeline:
+  • src/data/dataset.py
+    - Line 20-31: KICMSample TypedDict (already has conditions!)
+    - Line 58-136: __init__ (reads pH/temp)
+    - Line 160-175: __getitem__ (NaN detection, flags)
+
+  • src/data/collator.py
+    - Line 91-95: Extract conditions from batch items
+    - Line 169-180: Return conditions in batch dict
+
+  • src/data/kicm_datamodule.py
+    - Line 68-69: BUG: hard-coded dict access
+    - Line 72-81: _make_dataset calls KICMDataset with ph/temp cols
+
+Model Architecture:
+  • src/models/kicm_model.py
+    - Line 132-164: forward() signature (NEEDS CONDITIONS!)
+    - Line 149-163: Data flow (where FiLM should go)
+
+  • src/models/mlp_head.py
+    - Line 122-136: forward() - input point for FiLM output
+
+  • src/models/cross_attention.py
+    - Line 43-62: Output is [B, 512] - perfect FiLM input
+
+Training:
+  • src/models/kicm_module.py
+    - Line 72-85: training_step() (NEEDS CONDITION EXTRACTION!)
+    - Line 91-99: validation_step()
+    - Line 140-148: test_step()
+
+Configuration:
+  • configs/train_config.yaml
+    - Line 16-27: data section (MISSING ph_col, temp_col!)
+    - Line 29-73: model section (ADD film config here)
+
+
+📊 DATA STATISTICS AT A GLANCE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Datasets:
+  Train: 18,751 samples (17,693 with both conditions = 94.36%)
+  Val: 2,084 samples (2,012 with both = 96.5%)
+  Test: 2,316 samples (~2,160 with both = 93%)
+
+Missing Conditions (Train):
+  pH missing: 594 (3.17%)
+  Temperature missing: 708 (3.78%)
+  Both missing: 244 (1.30%)
+
+pH Range: 1.0 to 11.5 (mostly ~7.2, neutral/slightly basic)
+Temp Range: 0.0 to 105.0°C (mostly 25-30°C, room temperature)
+
+Key Insight: 94%+ samples have both conditions - FiLM can train!
+
+
+📄 ADDITIONAL RESOURCES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Full Report: DATA_PIPELINE_EXPLORATION.md (737 lines)
+  • Section 1: Raw data files & statistics
+  • Section 2: Missing value analysis (detailed)
+  • Section 3-7: Complete code walkthroughs with line numbers
+  • Section 8-10: Infrastructure status & implementation options
+  • Section 11-20: Bugs, recommendations, and reference materials
+
+
+🎓 LEARNING RESOURCES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+FiLM (Feature-wise Linear Modulation):
+  • Paper: "FiLM: Visual Reasoning with a General Conditioning Layer"
+  • Basic idea: output = (gamma * input) + beta
+  • gamma and beta are learned functions of conditioning variables
+  • Can handle variable input dimensions and multiple conditions
+
+For missing data handling:
+  • Strategy 1 (Masking - recommended): Use identity transform when unknown
+  • Strategy 2 (Dropout): Randomly ignore conditions during training
+  • Strategy 3 (Imputation): Train separate model to predict missing values
+
+
+✨ SUMMARY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+STATUS: Ready to implement! 80% infrastructure already in place.
+
+BLOCKING ISSUES: 2 config/code bugs preventing training
+
+MISSING VALUE STRATEGY: Masking (identity transform for unknown conditions)
+
+IMPLEMENTATION EFFORT: Medium (~200-300 lines of new code)
+
+KEY SUCCESS FACTORS:
+  1. Fix config bugs first
+  2. Design FiLM layer to handle known/unknown flags
+  3. Test with mixed condition scenarios
+  4. Monitor condition usage in training logs
+
+EXPECTED BENEFIT:
+  Model can now learn how Kcat varies with pH and temperature,
+  while remaining robust for historical data with missing conditions.
+

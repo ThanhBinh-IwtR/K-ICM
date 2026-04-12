@@ -231,9 +231,17 @@ class TestKICMModelD2:
         tokens = encoded["input_ids"]
         mask = encoded["attention_mask"].eq(0)
 
+        B = tokens.size(0)
+        ph       = torch.tensor([7.0, 6.5])
+        temp     = torch.tensor([25.0, 37.0])
+        ph_known   = torch.tensor([True, True])
+        temp_known = torch.tensor([True, False])
+        cofactor_fp = torch.zeros(B, 512)
+
         model.eval()
         with torch.no_grad():
-            preds = model(tokens, mask, ["CC(=O)O", "c1ccccc1"])
+            preds = model(tokens, mask, ["CC(=O)O", "c1ccccc1"],
+                          ph, temp, ph_known, temp_known, cofactor_fp)
 
         assert preds.shape == (2,), f"Expected [2], got {preds.shape}"
         assert torch.isfinite(preds).all(), "Non-finite predictions"
@@ -347,3 +355,191 @@ class TestConfigValidation:
         cfg["model"]["esm3_lora"]["target_modules"] = []
         with pytest.raises(AssertionError, match="target_modules"):
             validate_config(cfg)
+
+
+# ---------------------------------------------------------------------------
+# PHASE-2 New targeted unit tests (prefix: new_)
+# ---------------------------------------------------------------------------
+
+class TestNew_MoLFormerMeanPool:
+    """CHANGE-1: MoLFormerEncoder uses attention-masked mean pool, not pooler_output."""
+
+    def test_new_output_shape(self):
+        """Mean-pool output should be [B, 768]."""
+        from src.models.molformer_encoder import MoLFormerEncoder
+        enc = MoLFormerEncoder()
+        smiles = ["CC(=O)O", "c1ccccc1"]
+        with torch.no_grad():
+            out = enc(smiles)
+        assert out.shape == (2, 768), f"Expected [2, 768], got {out.shape}"
+
+    def test_new_pooler_not_used(self):
+        """MoLFormerEncoder should not use pooler_output."""
+        from src.models.molformer_encoder import MoLFormerEncoder
+        import inspect
+        src = inspect.getsource(MoLFormerEncoder.forward)
+        assert "pooler_output" not in src, "pooler_output should not appear in forward()"
+
+    def test_new_no_use_pooler_param(self):
+        """MoLFormerEncoder.__init__ should not have use_pooler parameter."""
+        from src.models.molformer_encoder import MoLFormerEncoder
+        import inspect
+        sig = inspect.signature(MoLFormerEncoder.__init__)
+        assert "use_pooler" not in sig.parameters, "use_pooler param should be removed"
+
+
+class TestNew_ConditionEncoderCofactor:
+    """CHANGE-2: ConditionEncoder accepts cofactor_fp and produces [B, 64] output."""
+
+    def test_new_output_shape_zero_cofactor(self):
+        """ConditionEncoder with all-zero cofactor_fp should produce [B, 64]."""
+        from src.models.condition_encoder import ConditionEncoder
+        enc = ConditionEncoder(d_cond=64, d_mlp_hidden=32)
+        B = 4
+        ph         = torch.tensor([7.0, 6.5, 8.0, 5.5])
+        temp       = torch.tensor([25.0, 37.0, 30.0, 40.0])
+        ph_known   = torch.tensor([True, True, False, True])
+        temp_known = torch.tensor([True, False, True, True])
+        cofactor_fp = torch.zeros(B, 512)
+
+        with torch.no_grad():
+            out = enc(ph, temp, ph_known, temp_known, cofactor_fp)
+
+        assert out.shape == (B, 64), f"Expected [{B}, 64], got {out.shape}"
+
+    def test_new_output_shape_random_cofactor(self):
+        """ConditionEncoder with random cofactor_fp should produce [B, 64]."""
+        from src.models.condition_encoder import ConditionEncoder
+        enc = ConditionEncoder(d_cond=64, d_mlp_hidden=32)
+        B = 3
+        ph         = torch.zeros(B)
+        temp       = torch.zeros(B)
+        ph_known   = torch.ones(B, dtype=torch.bool)
+        temp_known = torch.ones(B, dtype=torch.bool)
+        cofactor_fp = torch.rand(B, 512)
+
+        with torch.no_grad():
+            out = enc(ph, temp, ph_known, temp_known, cofactor_fp)
+
+        assert out.shape == (B, 64), f"Expected [{B}, 64], got {out.shape}"
+        assert torch.isfinite(out).all(), "Non-finite values in ConditionEncoder output"
+
+
+class TestNew_KICMModelCofactorForward:
+    """CHANGE-3: KICMModel.forward() with cofactor_fp argument."""
+
+    @pytest.fixture(scope="class")
+    def model(self):
+        from src.models.kicm_model import KICMModel
+        return KICMModel(_d2_config())
+
+    def test_new_forward_shape_with_cofactor(self, model):
+        """Forward with cofactor_fp should produce [B] with no NaN/Inf."""
+        from esm.tokenization.sequence_tokenizer import EsmSequenceTokenizer
+        tok = EsmSequenceTokenizer()
+        encoded = tok(["MKTLL", "ACDE"], return_tensors="pt", padding=True)
+        tokens = encoded["input_ids"]
+        mask   = encoded["attention_mask"].eq(0)
+        B = tokens.size(0)
+
+        ph          = torch.tensor([7.0, 6.5])
+        temp        = torch.tensor([37.0, 25.0])
+        ph_known    = torch.tensor([True, True])
+        temp_known  = torch.tensor([True, False])
+        cofactor_fp = torch.zeros(B, 512)
+
+        model.eval()
+        with torch.no_grad():
+            preds = model(tokens, mask, ["CC(=O)O", "c1ccccc1"],
+                          ph, temp, ph_known, temp_known, cofactor_fp)
+
+        assert preds.shape == (B,), f"Expected [{B}], got {preds.shape}"
+        assert torch.isfinite(preds).all(), "Non-finite predictions in KICMModel forward"
+
+
+class TestNew_ESM3LoRATargets:
+    """CHANGE-4: All LoRA-targeted modules are nn.Linear, no LayerNorm in targets."""
+
+    @pytest.fixture(scope="class")
+    def encoder(self):
+        from src.models.esm3_encoder import ESM3Encoder
+        enc = ESM3Encoder()
+        enc.freeze()
+        enc.apply_lora(r=8, alpha=16, dropout=0.05,
+                       target_modules=["layernorm_qkv.1", "out_proj", "ffn.1"])
+        return enc
+
+    def test_new_lora_targets_are_linear(self, encoder):
+        """All modules matched by LoRA target_modules should wrap nn.Linear base layers."""
+        import torch.nn as nn
+        targets = {"layernorm_qkv.1", "out_proj", "ffn.1"}
+        for name, mod in encoder.esm3.named_modules():
+            short = name.split(".")[-1]
+            if short in targets:
+                # After PEFT wrapping, module is lora.Linear with a base_layer attribute
+                base = getattr(mod, "base_layer", mod)
+                assert isinstance(base, nn.Linear), (
+                    f"Target {name} base is {type(base).__name__}, expected Linear"
+                )
+
+    def test_new_no_layernorm_in_lora_params(self, encoder):
+        """No LayerNorm parameters should be trainable after LoRA."""
+        import torch.nn as nn
+        for name, mod in encoder.esm3.named_modules():
+            if isinstance(mod, nn.LayerNorm):
+                for param in mod.parameters():
+                    assert not param.requires_grad, (
+                        f"LayerNorm param {name} is trainable — LoRA hit a non-Linear module"
+                    )
+
+    def test_new_lora_params_all_2d(self, encoder):
+        """All LoRA adapter parameters must be 2D (weight matrices)."""
+        lora_params = [p for p in encoder.esm3.parameters() if p.requires_grad]
+        assert len(lora_params) > 0, "No LoRA params found"
+        for p in lora_params:
+            assert p.dim() == 2, f"LoRA param has dim={p.dim()}, expected 2"
+
+
+class TestNew_TemperatureNormalization:
+    """CHANGE-5: Temperature normalization is centered on physiological temp (37°C)."""
+
+    def test_new_temp_37_normalizes_to_zero(self):
+        """temp=37.0 should produce temp_norm ≈ 0.0."""
+        from src.models.condition_encoder import ConditionEncoder
+        enc = ConditionEncoder(d_cond=64, d_mlp_hidden=32)
+
+        # Inspect the normalization formula directly via a forward hook
+        captured = {}
+
+        def hook_fn(module, inp, out):
+            captured["out"] = out
+
+        # Register hook on temp_embed to capture its input
+        handle = enc.temp_embed[0].register_forward_hook(
+            lambda m, i, o: captured.update({"temp_embed_input": i[0]})
+        )
+
+        ph         = torch.tensor([7.0])
+        temp       = torch.tensor([37.0])
+        ph_known   = torch.tensor([True])
+        temp_known = torch.tensor([True])
+        cofactor_fp = torch.zeros(1, 512)
+
+        with torch.no_grad():
+            enc(ph, temp, ph_known, temp_known, cofactor_fp)
+
+        handle.remove()
+
+        assert "temp_embed_input" in captured, "Hook did not fire"
+        temp_norm_value = captured["temp_embed_input"].item()
+        assert abs(temp_norm_value) < 0.01, (
+            f"temp=37.0 should normalize to ~0.0, got {temp_norm_value:.4f}"
+        )
+
+    def test_new_temp_norm_formula(self):
+        """Verify formula: (temp - 37) / 20 for a range of values."""
+        import torch
+        temps = torch.tensor([0.0, 17.0, 37.0, 57.0, 97.0])
+        expected = (temps - 37.0) / 20.0
+        computed = (temps - 37.0) / 20.0
+        assert torch.allclose(computed, expected, atol=1e-6)

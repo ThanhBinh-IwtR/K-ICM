@@ -62,8 +62,16 @@ class KICMLightningModule(pl.LightningModule):
         sequence_tokens: Tensor,
         padding_mask: Tensor,
         smiles_list: list[str],
+        ph: Tensor,
+        temp: Tensor,
+        ph_known: Tensor,
+        temp_known: Tensor,
+        cofactor_fp: Tensor,
     ) -> Tensor:
-        return self.model(sequence_tokens, padding_mask, smiles_list)
+        return self.model(
+            sequence_tokens, padding_mask, smiles_list,
+            ph, temp, ph_known, temp_known, cofactor_fp,
+        )
 
     # ------------------------------------------------------------------
     # Training
@@ -71,12 +79,15 @@ class KICMLightningModule(pl.LightningModule):
 
     def training_step(self, batch: dict, batch_idx: int) -> Tensor:
         sequence_tokens = batch["sequence_tokens"]
-        padding_mask = batch["padding_mask"]
-        smiles_list = batch["smiles"]
+        padding_mask = batch["esm_pad_mask"]    # D2-BugC fix: was batch["padding_mask"]
         targets = batch["targets"].squeeze(-1)  # [B,1] -> [B]
         batch_size = targets.size(0)
 
-        preds = self(sequence_tokens, padding_mask, smiles_list)
+        preds = self(
+            sequence_tokens, padding_mask, batch["smiles"],
+            batch["ph"], batch["temp"], batch["ph_known"], batch["temp_known"],
+            batch["cofactor_fp"],
+        )
         loss = self.criterion(preds, targets)
 
         self.log("train/loss", loss,
@@ -91,8 +102,13 @@ class KICMLightningModule(pl.LightningModule):
     def validation_step(self, batch: dict, batch_idx: int) -> None:
         preds = self(
             batch["sequence_tokens"],
-            batch["padding_mask"],
+            batch["esm_pad_mask"],   # D2-BugC fix: was batch["padding_mask"]
             batch["smiles"],
+            batch["ph"],
+            batch["temp"],
+            batch["ph_known"],
+            batch["temp_known"],
+            batch["cofactor_fp"],
         )
         targets = batch["targets"].squeeze(-1)
         self.val_preds.append(preds.detach().cpu().reshape(-1))
@@ -140,8 +156,13 @@ class KICMLightningModule(pl.LightningModule):
     def test_step(self, batch: dict, batch_idx: int) -> None:
         preds = self(
             batch["sequence_tokens"],
-            batch["padding_mask"],
+            batch["esm_pad_mask"],   # D2-BugC fix: was batch["padding_mask"]
             batch["smiles"],
+            batch["ph"],
+            batch["temp"],
+            batch["ph_known"],
+            batch["temp_known"],
+            batch["cofactor_fp"],
         )
         targets = batch["targets"].squeeze(-1)
         self.test_preds.append(preds.detach().cpu().reshape(-1))
@@ -201,9 +222,8 @@ class KICMLightningModule(pl.LightningModule):
         self.test_preds.clear()
         self.test_targets.clear()
 
-    def _save_predictions_csv(self, preds: "np.ndarray", output_path: str) -> None:
+    def _save_predictions_csv(self, preds: Any, output_path: str) -> None:
         """Save test predictions merged with original test CSV for OOD eval."""
-        import numpy as np  # noqa: PLC0415
         from pathlib import Path  # noqa: PLC0415
         import pandas as pd  # noqa: PLC0415
 
@@ -293,6 +313,18 @@ class KICMLightningModule(pl.LightningModule):
             mol_lora_ids = {id(p) for p in molformer_lora_params}
         else:
             mol_lora_ids = set()
+
+        # Condition unknown embeddings: zero-init learned vectors — must NOT be L2-shrunk
+        _cond = self.model.cond_encoder
+        _cond_unknown_ids: set[int] = set()
+        for _attr in ("ph_unknown", "temp_unknown"):
+            if hasattr(_cond, _attr):
+                _p = getattr(_cond, _attr)
+                task_no_decay.append(_p)
+                _cond_unknown_ids.add(id(_p))
+
+        # Merge into lora_ids so the main loop skips them
+        lora_ids.update(_cond_unknown_ids)
 
         for name, param in self.model.named_parameters():
             if not param.requires_grad:

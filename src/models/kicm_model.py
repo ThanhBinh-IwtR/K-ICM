@@ -16,6 +16,7 @@ from .molformer_encoder import MoLFormerEncoder
 from .mlp_head import MLPHead
 from .projection import ProjectionLayer
 from .cross_attention import CrossAttentionFusion
+from .condition_encoder import ConditionEncoder, FiLMLayer
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +69,6 @@ class KICMModel(nn.Module):
         self.substrate_encoder = MoLFormerEncoder(
             model_name=model_cfg.get("molformer_model", "ibm/MoLFormer-XL-both-10pct"),
             max_length=model_cfg.get("molformer_max_length", 202),
-            use_pooler=model_cfg.get("molformer_use_pooler", True),
             d_output=d_substrate,
         )
 
@@ -113,6 +113,17 @@ class KICMModel(nn.Module):
             activation=mlp_cfg.get("activation", "gelu"),
         )
 
+        # FiLM conditioning (pH / temperature)
+        cond_cfg = config.get("conditioning", {})
+        self.cond_encoder = ConditionEncoder(
+            d_cond=cond_cfg.get("d_cond", 64),
+            d_mlp_hidden=cond_cfg.get("d_mlp_hidden", 32),
+        )
+        self.film = FiLMLayer(
+            d_ctx=d_fusion,
+            d_cond=cond_cfg.get("d_cond", 64),
+        )
+
         mol_status = "frozen" if molformer_frozen else "trainable"
         if mol_lora_enabled:
             mol_status += "+lora"
@@ -132,8 +143,13 @@ class KICMModel(nn.Module):
     def forward(
         self,
         sequence_tokens: Tensor,
-        padding_mask: Tensor,
-        smiles_list: list[str],
+        padding_mask:    Tensor,
+        smiles_list:     list[str],
+        ph:              Tensor,       # [B] float32
+        temp:            Tensor,       # [B] float32
+        ph_known:        Tensor,       # [B] bool
+        temp_known:      Tensor,       # [B] bool
+        cofactor_fp:     Tensor,       # [B, 512] float32
     ) -> Tensor:
         """Predict target kinetic parameter for a batch.
 
@@ -141,6 +157,11 @@ class KICMModel(nn.Module):
             sequence_tokens: LongTensor [B, L] — ESM-3 tokenised sequences.
             padding_mask: BoolTensor [B, L] — True at padding positions.
             smiles_list: list[str] of length B — substrate SMILES.
+            ph: FloatTensor [B] — pH values (0.0 if unknown).
+            temp: FloatTensor [B] — temperature in °C (0.0 if unknown).
+            ph_known: BoolTensor [B] — True if pH was measured.
+            temp_known: BoolTensor [B] — True if temperature was measured.
+            cofactor_fp: FloatTensor [B, 512] — binary Morgan fingerprint for cofactor.
 
         Returns:
             FloatTensor [B] — predicted log10 target values.
@@ -158,6 +179,10 @@ class KICMModel(nn.Module):
             protein_residues=hidden,
             protein_pad_mask=mask,
         )  # [B, d_proj]
+
+        # FiLM conditioning
+        cond_vec = self.cond_encoder(ph, temp, ph_known, temp_known, cofactor_fp)
+        ctx = self.film(ctx, cond_vec)
 
         # MLP prediction
         predictions = self.mlp_head(ctx)  # [B]

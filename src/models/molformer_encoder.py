@@ -37,8 +37,6 @@ class MoLFormerEncoder(nn.Module):
     Args:
         model_name:  HuggingFace model identifier
         max_length:  Maximum SMILES token length (MoLFormer max = 202)
-        use_pooler:  If True and pooler_output available, use it.
-                     Else: attention-masked mean pool of last_hidden_state.
         d_output:    Expected output dim. Must equal D_MOLFORMER.
     """
 
@@ -48,13 +46,11 @@ class MoLFormerEncoder(nn.Module):
         self,
         model_name: str  = MODEL_NAME,
         max_length: int  = 202,
-        use_pooler: bool = True,
         d_output:   int  = D_MOLFORMER,
     ):
         super().__init__()
         self.model_name = model_name
         self.max_length = max_length
-        self.use_pooler = use_pooler
         self.d_output   = d_output
 
         # Load tokenizer and model
@@ -170,21 +166,19 @@ class MoLFormerEncoder(nn.Module):
                             enabled=(device.type == "cuda")):
             outputs = self._model(**inputs)
 
-        # Extract pooled molecular representation
-        if self.use_pooler and outputs.pooler_output is not None:
-            embedding = outputs.pooler_output   # [B, d]
+        # Pooling: prefer pooler_output if available, else attention-masked mean pool
+        if hasattr(outputs, 'pooler_output') and outputs.pooler_output is not None:
+            h = outputs.pooler_output
         else:
-            # Attention-masked mean pool
-            mask   = inputs["attention_mask"].unsqueeze(-1).float()   # [B, S, 1]
-            hidden = outputs.last_hidden_state.float()                 # [B, S, d]
-            embedding = (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-9)
+            mask_expanded = inputs['attention_mask'].unsqueeze(-1).float()
+            h = (outputs.last_hidden_state * mask_expanded).sum(1) / mask_expanded.sum(1).clamp(min=1)
+        h = h.float()
 
-        return embedding.float()   # ensure float32 for downstream
+        return h   # [B, d_output] float32
 
     def extra_repr(self) -> str:
         return (
             f"model={self.model_name}  "
             f"d_output={self.d_output}  "
-            f"use_pooler={self.use_pooler}  "
             f"max_length={self.max_length}"
         )
