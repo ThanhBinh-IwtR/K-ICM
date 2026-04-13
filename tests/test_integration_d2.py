@@ -34,10 +34,12 @@ def _integration_config() -> dict:
             "molformer_max_length": 202,
             "projection_normalize_input": True,
             "esm3_lora": {
+                "enabled": True,
                 "r": 8,
                 "alpha": 16,
                 "dropout": 0.05,
                 "target_modules": ["layernorm_qkv.1", "out_proj", "ffn.1"],
+                "lora_start_block": 36,
             },
             "cross_attention": {
                 "enabled": True,
@@ -45,6 +47,7 @@ def _integration_config() -> dict:
                 "d_prot": 1536,
                 "n_heads": 8,
                 "dropout": 0.0,
+                "n_queries": 4,
             },
             "mlp": {
                 "hidden_dims": [512, 256, 128],
@@ -84,7 +87,7 @@ def _integration_config() -> dict:
             "lr": {
                 "task": 2e-4,
                 "molformer": 2e-5,
-                "esm3_lora": 1e-5,
+                "esm3_lora": 2e-5,
             },
             "weight_decay": 1e-2,
             "adam_eps": 1e-8,

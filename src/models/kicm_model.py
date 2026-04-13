@@ -58,12 +58,20 @@ class KICMModel(nn.Module):
         # Protein encoder (residue-level output for cross-attention)
         self.esm3_encoder = ESM3Encoder(model_name=esm_variant, d_model=d_esm)
         self.esm3_encoder.freeze()
-        self.esm3_encoder.apply_lora(
-            r=lora_cfg.get("r", 16),
-            alpha=lora_cfg.get("alpha", 32),
-            dropout=lora_cfg.get("dropout", 0.05),
-            target_modules=lora_cfg.get("target_modules", None),
-        )
+
+        # ESM3 LoRA — only apply when enabled (default True for backward compat)
+        self._esm3_lora_enabled: bool = lora_cfg.get("enabled", True)
+        if self._esm3_lora_enabled:
+            self.esm3_encoder.apply_lora(
+                r=lora_cfg.get("r", 16),
+                alpha=lora_cfg.get("alpha", 32),
+                dropout=lora_cfg.get("dropout", 0.05),
+                target_modules=lora_cfg.get("target_modules", None),
+                lora_start_block=lora_cfg.get("lora_start_block", 0),
+            )
+            logger.info("[KICMModel] ESM3 LoRA ENABLED (r=%d)", lora_cfg.get("r", 16))
+        else:
+            logger.info("[KICMModel] ESM3 LoRA DISABLED — backbone fully frozen")
 
         # Substrate encoder (MoLFormer-XL)
         self.substrate_encoder = MoLFormerEncoder(
@@ -103,6 +111,7 @@ class KICMModel(nn.Module):
             d_prot=ca_cfg["d_prot"],
             n_heads=ca_cfg["n_heads"],
             dropout=ca_cfg["dropout"],
+            n_queries=ca_cfg.get("n_queries", 1),
         )
 
         # MLP prediction head
@@ -113,16 +122,24 @@ class KICMModel(nn.Module):
             activation=mlp_cfg.get("activation", "gelu"),
         )
 
-        # FiLM conditioning (pH / temperature)
+        # ConditionEncoder + FiLMLayer for pH/temp/cofactor conditioning (optional)
         cond_cfg = config.get("conditioning", {})
-        self.cond_encoder = ConditionEncoder(
-            d_cond=cond_cfg.get("d_cond", 64),
-            d_mlp_hidden=cond_cfg.get("d_mlp_hidden", 32),
-        )
-        self.film = FiLMLayer(
-            d_ctx=d_fusion,
-            d_cond=cond_cfg.get("d_cond", 64),
-        )
+        self.use_conditioning = cond_cfg.get("use_conditioning", True)
+
+        if self.use_conditioning:
+            self.cond_encoder = ConditionEncoder(
+                d_cond=cond_cfg.get("d_cond", 64),
+                d_mlp_hidden=cond_cfg.get("d_mlp_hidden", 32),
+            )
+            self.film = FiLMLayer(
+                d_ctx=d_fusion,
+                d_cond=cond_cfg.get("d_cond", 64),
+            )
+            logger.info("[KICMModel] FiLM conditioning ENABLED (d_cond=%d)", cond_cfg.get("d_cond", 64))
+        else:
+            self.cond_encoder = None
+            self.film = None
+            logger.info("[KICMModel] FiLM conditioning DISABLED — bare ESM3+MoLFormer+CA+MLP")
 
         mol_status = "frozen" if molformer_frozen else "trainable"
         if mol_lora_enabled:
@@ -181,8 +198,9 @@ class KICMModel(nn.Module):
         )  # [B, d_proj]
 
         # FiLM conditioning
-        cond_vec = self.cond_encoder(ph, temp, ph_known, temp_known, cofactor_fp)
-        ctx = self.film(ctx, cond_vec)
+        if self.use_conditioning:
+            cond_vec = self.cond_encoder(ph, temp, ph_known, temp_known, cofactor_fp)
+            ctx = self.film(ctx, cond_vec)
 
         # MLP prediction
         predictions = self.mlp_head(ctx)  # [B]

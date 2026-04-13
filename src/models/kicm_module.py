@@ -288,9 +288,12 @@ class KICMLightningModule(pl.LightningModule):
         lr_cfg = train_cfg["lr"]
         wd = train_cfg["weight_decay"]
 
-        # LoRA adapters have no bias (bias="none" in LoraConfig)
-        # All LoRA params are 2D matrices — all go to decay group
-        lora_params = list(self.model.esm3_encoder.lora_parameters())
+        # ESM3 LoRA: only collect params if LoRA is enabled in config AND in model
+        esm3_lora_enabled = self.config.get("model", {}).get("esm3_lora", {}).get("enabled", True)
+        if esm3_lora_enabled and getattr(self.model, '_esm3_lora_enabled', True):
+            lora_params = list(self.model.esm3_encoder.lora_parameters())
+        else:
+            lora_params = []
         lora_ids = {id(p) for p in lora_params}
 
         # Determine MoLFormer state

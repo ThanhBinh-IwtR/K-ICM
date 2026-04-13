@@ -96,4 +96,11 @@ def validate_config(config: dict) -> None:
         f"lr.esm3_lora ({lr_cfg['esm3_lora']}) should be < lr.task ({lr_cfg.get('task')})"
     )
 
+    # Conditioning block validation
+    cond = config.get("conditioning", {})
+    use_cond = cond.get("use_conditioning", True)
+    if "conditioning" in config and use_cond:
+        assert "d_cond" in cond, "[validate_config] conditioning.d_cond required when use_conditioning=True"
+        assert "d_mlp_hidden" in cond, "[validate_config] conditioning.d_mlp_hidden required when use_conditioning=True"
+
     logger.info("[validate_config] D2 LoRA config validation passed.")

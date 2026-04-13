@@ -45,7 +45,7 @@ model:
 
   molformer_lora:
     enabled:        true        # set true in experiment 2, do not change now
-    r:              12
+    r:              16
     alpha:          16
     dropout:        0.05
     target_modules: ["attention.self.query",
@@ -58,16 +58,19 @@ model:
   projection_normalize_input: true
 
   esm3_lora:
+    enabled:        true    # Re-enabled: LoRA restricted to last 12 blocks
     r:              12
     alpha:          24
     dropout:        0.05
     target_modules: ["layernorm_qkv.1", "out_proj", "ffn.1"]   # verified nn.Linear from named_modules scan
+    lora_start_block: 36    # Freeze LoRA in blocks 0-35, train blocks 36-47 only
 
   cross_attention:
     d_sub:          512
     d_prot:         1536
     n_heads:        8
     dropout:        0.1
+    n_queries:      4       # Multi-query: 4 learned substrate queries
 
   mlp:
     hidden_dims:  [512, 256, 128]
@@ -76,6 +79,7 @@ model:
 
 # ---- Conditioning (FiLM pH/Temperature) ----------------------------
 conditioning:
+  use_conditioning: false  # Ablation: FiLM + ConditionEncoder disabled
   d_cond:       64    # dimension of condition vector fed to FiLMLayer
   d_mlp_hidden: 32    # hidden dim of pH/temp scalar embedding MLPs
 
@@ -86,22 +90,22 @@ training:
   precision:      "bf16-mixed"
   find_unused_parameters: false
 
-  batch_size_per_gpu:          2
-  gradient_accumulation_steps: 64
-  effective_batch_size:        128
+  batch_size_per_gpu:          6
+  gradient_accumulation_steps: 8
+  effective_batch_size:        96    # 6 × 2 GPUs × 8 accum — halved from 16 accum
 
   max_epochs:           100
   val_every_n_epochs:   1
 
   loss:        "huber"
-  huber_beta:  1.0
+  huber_beta:  0.3
 
   gradient_clip_norm: 1.0
 
   lr:
     task:          2.0e-4
     molformer:   5.0e-5    # irrelevant while molformer_frozen: true
-    esm3_lora:     7.0e-6
+    esm3_lora:     2.0e-5
     molformer_lora: 5.0e-5   # only used when molformer_lora.enabled is true
 
   weight_decay:    1.0e-2
@@ -116,7 +120,7 @@ training:
     monitor:    "val/r2"
     mode:       "max"
     patience:   15
-    min_delta:  0.001
+    min_delta:  0.0005
 
   checkpoint:
     save_top_k:   3

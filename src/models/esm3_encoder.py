@@ -157,6 +157,7 @@ class ESM3Encoder(nn.Module):
         alpha: int = 32,
         dropout: float = 0.05,
         target_modules: list[str] | None = None,
+        lora_start_block: int = 0,
     ) -> None:
         """Wrap ESM-3 with LoRA adapters via PEFT.
 
@@ -168,6 +169,8 @@ class ESM3Encoder(nn.Module):
             alpha: LoRA scaling factor.
             dropout: Dropout on LoRA layers.
             target_modules: Linear layer names to adapt. Default: ["q_proj", "v_proj"].
+            lora_start_block: First block to keep LoRA trainable. Blocks before
+                this index have their LoRA params frozen. Default: 0 (all blocks).
         """
         if target_modules is None:
             target_modules = ["layernorm_qkv.1", "out_proj", "ffn.1"]  # verified nn.Linear from named_modules scan
@@ -180,6 +183,14 @@ class ESM3Encoder(nn.Module):
             bias="none",
         )
         self.esm3 = get_peft_model(self.esm3, lora_config)
+
+        if lora_start_block > 0:
+            active, frozen = self._restrict_lora_to_last_blocks(lora_start_block)
+            logger.info(
+                "[ESM3Encoder] LoRA restricted to blocks >=%d: "
+                "%d active params, %d frozen params",
+                lora_start_block, active, frozen,
+            )
 
         n_lora = sum(p.numel() for p in self.esm3.parameters() if p.requires_grad)
         n_total = sum(p.numel() for p in self.esm3.parameters())
@@ -194,6 +205,32 @@ class ESM3Encoder(nn.Module):
             r, alpha, dropout, target_modules,
             n_lora, n_total, 100.0 * n_lora / n_total,
         )
+
+    def _restrict_lora_to_last_blocks(self, start_block: int) -> tuple[int, int]:
+        """After get_peft_model(), freeze LoRA params for blocks < start_block.
+
+        Returns:
+            Tuple of (active_param_count, frozen_param_count).
+        """
+        active, frozen = 0, 0
+        for name, param in self.esm3.named_parameters():
+            if 'lora_' not in name:
+                continue
+            block_idx = None
+            parts = name.split('.')
+            for i, part in enumerate(parts):
+                if part == 'blocks' and i + 1 < len(parts):
+                    try:
+                        block_idx = int(parts[i + 1])
+                        break
+                    except ValueError:
+                        continue
+            if block_idx is not None and block_idx < start_block:
+                param.requires_grad_(False)
+                frozen += 1
+            else:
+                active += 1
+        return active, frozen
 
     def lora_parameters(self):
         """Yield only LoRA adapter parameters (for optimizer param groups)."""

@@ -6,9 +6,13 @@ Tests:
   3. KICMModel: end-to-end forward pass with LoRA
   4. KICMLightningModule: 5 param groups (LoRA has no bias), configure_optimizers
   5. Config validation: D2 LoRA config passes, D1 config rejected
+  6. Multi-query cross-attention: n_queries=4 output shape, backward, query_proj
+  7. ESM3 LoRA block restriction: blocks 0-35 frozen, 36-47 trainable
+  8. KICMModel new config: forward with n_queries=4 + ESM3 LoRA last12
 """
 from __future__ import annotations
 
+import copy
 import sys
 import os
 from unittest.mock import MagicMock
@@ -543,3 +547,322 @@ class TestNew_TemperatureNormalization:
         expected = (temps - 37.0) / 20.0
         computed = (temps - 37.0) / 20.0
         assert torch.allclose(computed, expected, atol=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# Test 6: KICMModel with use_conditioning=False
+# ---------------------------------------------------------------------------
+
+class TestKICMModelNoConditioning:
+    """Verify use_conditioning=False bypasses FiLM and ConditionEncoder."""
+
+    def _no_cond_config(self):
+        """Minimal config with conditioning disabled."""
+        cfg = _d2_config()
+        cfg["conditioning"] = {"use_conditioning": False}
+        return cfg
+
+    def test_film_modules_are_none(self):
+        """cond_encoder and film must be None when use_conditioning=False."""
+        from src.models.kicm_model import KICMModel
+        model = KICMModel(self._no_cond_config())
+        assert model.cond_encoder is None, "cond_encoder should be None when use_conditioning=False"
+        assert model.film is None, "film should be None when use_conditioning=False"
+        assert model.use_conditioning is False
+
+    def test_forward_no_conditioning_shape(self):
+        """Forward pass with use_conditioning=False must return [B] tensor."""
+        from src.models.kicm_model import KICMModel
+        from esm.tokenization.sequence_tokenizer import EsmSequenceTokenizer
+        import torch
+
+        model = KICMModel(self._no_cond_config())
+        model.eval()
+
+        tok = EsmSequenceTokenizer()
+        B = 2
+        seqs = ["MKTLLLTLVVVTIVCLDLGAVAGNLG", "ACDEFGHIKL"]
+        encoded = tok(seqs, return_tensors="pt", padding=True)
+        tokens = encoded["input_ids"]
+        pad_mask = encoded["attention_mask"].eq(0)
+
+        with torch.no_grad():
+            preds = model(
+                tokens, pad_mask,
+                ["CC(=O)O", "c1ccccc1"],
+                torch.tensor([7.0, 6.5]),
+                torch.tensor([37.0, 25.0]),
+                torch.tensor([True, True]),
+                torch.tensor([True, False]),
+                torch.zeros(B, 512),
+            )
+
+        assert preds.shape == (B,), f"Expected [{B}], got {preds.shape}"
+        assert torch.isfinite(preds).all(), f"Non-finite predictions: {preds}"
+
+    def test_forward_no_conditioning_is_finite(self):
+        """Forward output must be finite when conditioning is disabled."""
+        # This test is implicitly covered by test_forward_no_conditioning_shape
+        # but kept separate for clarity in CI output
+        from src.models.kicm_model import KICMModel
+        from esm.tokenization.sequence_tokenizer import EsmSequenceTokenizer
+        import torch
+
+        model = KICMModel(self._no_cond_config())
+        model.eval()
+        tok = EsmSequenceTokenizer()
+        B = 2
+        encoded = tok(["MKTLLLTLVVVTIVCLDLGAVAGNLG", "ACDEFGHIKL"], return_tensors="pt", padding=True)
+        tokens = encoded["input_ids"]
+        pad_mask = encoded["attention_mask"].eq(0)
+
+        with torch.no_grad():
+            preds = model(
+                tokens, pad_mask,
+                ["CC(=O)O", "c1ccccc1"],
+                torch.tensor([7.0, 6.5]),
+                torch.tensor([37.0, 25.0]),
+                torch.tensor([True, True]),
+                torch.tensor([True, False]),
+                torch.zeros(B, 512),
+            )
+        assert torch.isfinite(preds).all()
+
+
+# ---------------------------------------------------------------------------
+# Test 7: ESM3 LoRA disabled — optimizer must not contain esm3_lora group
+# ---------------------------------------------------------------------------
+
+def test_esm3_lora_disabled_no_optimizer_group():
+    """When esm3_lora.enabled=False, optimizer must not contain esm3_lora group."""
+    from unittest.mock import MagicMock, PropertyMock
+    from src.models.kicm_module import KICMLightningModule
+
+    # Build config with esm3_lora.enabled=False and MoLFormer LoRA enabled
+    cfg = _d2_config()
+    cfg["model"]["esm3_lora"] = {
+        "enabled": False,
+        "r": 12,
+        "alpha": 24,
+        "dropout": 0.05,
+        "target_modules": ["layernorm_qkv.1", "out_proj", "ffn.1"],
+    }
+    cfg["model"]["molformer_frozen"] = True
+    cfg["model"]["molformer_lora"] = {
+        "enabled": True,
+        "r": 16,
+        "alpha": 16,
+        "dropout": 0.05,
+        "target_modules": [
+            "attention.self.query", "attention.self.key",
+            "attention.self.value", "attention.output.dense",
+            "intermediate.dense", "output.dense",
+        ],
+    }
+    cfg["training"]["lr"]["molformer_lora"] = 5e-5
+    cfg["conditioning"] = {"use_conditioning": False}
+
+    module = KICMLightningModule(cfg)
+
+    # Mock trainer.estimated_stepping_batches for scheduler
+    mock_trainer = MagicMock()
+    type(mock_trainer).estimated_stepping_batches = PropertyMock(return_value=1000)
+    module._trainer = mock_trainer
+
+    # configure_optimizers should not crash
+    opt_result = module.configure_optimizers()
+    optimizer = opt_result["optimizer"]
+
+    # Assert: no param group has name == "esm3_lora"
+    group_names = [g.get("name", "") for g in optimizer.param_groups]
+    assert "esm3_lora" not in group_names, (
+        f"esm3_lora group should not exist when enabled=False. Found groups: {group_names}"
+    )
+
+    # Assert: optimizer initializes without RuntimeError (implicitly tested above)
+    # Assert: at least task_decay and molformer_lora groups exist
+    assert "task_decay" in group_names, f"task_decay missing. Groups: {group_names}"
+    assert "molformer_lora" in group_names, f"molformer_lora missing. Groups: {group_names}"
+
+    # Assert: no ESM3 LoRA params have requires_grad=True in model
+    esm3_trainable = sum(
+        1 for p in module.model.esm3_encoder.parameters() if p.requires_grad
+    )
+    assert esm3_trainable == 0, (
+        f"ESM3 encoder should have 0 trainable params when LoRA disabled, found {esm3_trainable}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 8: CrossAttentionFusion multi-query
+# ---------------------------------------------------------------------------
+
+class TestCrossAttentionMultiQuery:
+    def test_n_queries_4_output_shape(self):
+        """n_queries=4 must still output [B, d_sub]."""
+        from src.models.cross_attention import CrossAttentionFusion
+        B, L, d_sub, d_prot = 3, 20, 512, 1536
+        model = CrossAttentionFusion(
+            d_sub=d_sub, d_prot=d_prot, n_heads=8, dropout=0.0, n_queries=4
+        )
+        model.eval()
+        h_sub = torch.randn(B, d_sub)
+        protein = torch.randn(B, L, d_prot)
+        pad_mask = torch.zeros(B, L, dtype=torch.bool)
+        with torch.no_grad():
+            out = model(h_sub, protein, pad_mask)
+        assert out.shape == (B, d_sub), f"Expected ({B},{d_sub}), got {out.shape}"
+        assert not torch.isnan(out).any(), "NaN in output"
+
+    def test_n_queries_1_matches_legacy(self):
+        """n_queries=1 must produce same shape as original single-query."""
+        from src.models.cross_attention import CrossAttentionFusion
+        torch.manual_seed(42)
+        B, L, d_sub, d_prot = 2, 15, 512, 1536
+        model = CrossAttentionFusion(
+            d_sub=d_sub, d_prot=d_prot, n_heads=8, dropout=0.0, n_queries=1
+        )
+        model.eval()
+        h_sub = torch.randn(B, d_sub)
+        protein = torch.randn(B, L, d_prot)
+        pad_mask = torch.zeros(B, L, dtype=torch.bool)
+        with torch.no_grad():
+            out = model(h_sub, protein, pad_mask)
+        assert out.shape == (B, d_sub)
+
+    def test_query_proj_exists_only_when_n_queries_gt_1(self):
+        """query_proj must exist iff n_queries > 1."""
+        from src.models.cross_attention import CrossAttentionFusion
+        m1 = CrossAttentionFusion(512, 1536, 8, 0.0, n_queries=1)
+        m4 = CrossAttentionFusion(512, 1536, 8, 0.0, n_queries=4)
+        assert not hasattr(m1, 'query_proj'), "n_queries=1 must NOT have query_proj"
+        assert hasattr(m4, 'query_proj'), "n_queries=4 must have query_proj"
+        assert m4.query_proj.weight.shape == (4 * 512, 512)
+
+    def test_n_queries_4_backward(self):
+        """Backward must complete with n_queries=4."""
+        from src.models.cross_attention import CrossAttentionFusion
+        B, L, d_sub, d_prot = 2, 10, 512, 1536
+        model = CrossAttentionFusion(512, 1536, 8, 0.0, n_queries=4)
+        h_sub = torch.randn(B, d_sub, requires_grad=True)
+        protein = torch.randn(B, L, d_prot)
+        pad_mask = torch.zeros(B, L, dtype=torch.bool)
+        out = model(h_sub, protein, pad_mask)
+        loss = out.sum()
+        loss.backward()
+        assert h_sub.grad is not None
+        assert not torch.isnan(h_sub.grad).any()
+
+
+# ---------------------------------------------------------------------------
+# Test 9: ESM3 LoRA block restriction
+# ---------------------------------------------------------------------------
+
+class TestESM3LoRALastBlocks:
+    def test_lora_params_only_in_last_blocks(self):
+        """After apply_lora(lora_start_block=36), LoRA params in blocks 0-35
+        must be frozen, blocks 36-47 must be trainable."""
+        from src.models.esm3_encoder import ESM3Encoder
+        enc = ESM3Encoder(model_name="esm3_sm_open_v1", d_model=1536)
+        enc.freeze()
+        enc.apply_lora(r=4, alpha=8, dropout=0.0,
+                       target_modules=["layernorm_qkv.1", "out_proj", "ffn.1"],
+                       lora_start_block=36)
+        for name, param in enc.esm3.named_parameters():
+            if 'lora_' not in name:
+                continue
+            parts = name.split('.')
+            block_idx = None
+            for i, p in enumerate(parts):
+                if p == 'blocks' and i + 1 < len(parts):
+                    try:
+                        block_idx = int(parts[i + 1])
+                        break
+                    except ValueError:
+                        continue
+            if block_idx is not None:
+                if block_idx < 36:
+                    assert not param.requires_grad, \
+                        f"Block {block_idx} LoRA param should be frozen: {name}"
+                else:
+                    assert param.requires_grad, \
+                        f"Block {block_idx} LoRA param should be trainable: {name}"
+
+    def test_lora_start_block_0_all_trainable(self):
+        """lora_start_block=0 (default) must leave all LoRA params trainable."""
+        from src.models.esm3_encoder import ESM3Encoder
+        enc = ESM3Encoder(model_name="esm3_sm_open_v1", d_model=1536)
+        enc.freeze()
+        enc.apply_lora(r=4, alpha=8, dropout=0.0,
+                       target_modules=["layernorm_qkv.1", "out_proj", "ffn.1"],
+                       lora_start_block=0)
+        lora_params = [p for n, p in enc.esm3.named_parameters()
+                       if 'lora_' in n]
+        assert all(p.requires_grad for p in lora_params), \
+            "lora_start_block=0 must leave all LoRA params trainable"
+
+
+# ---------------------------------------------------------------------------
+# Test 10: KICMModel with new config (n_queries=4 + ESM3 LoRA last12)
+# ---------------------------------------------------------------------------
+
+class TestKICMModelNewConfig:
+    def test_forward_n_queries_4_esm3_lora_last12(self):
+        """Full forward with n_queries=4 and esm3_lora last 12 blocks."""
+        from src.models.kicm_model import KICMModel
+        from esm.tokenization.sequence_tokenizer import EsmSequenceTokenizer
+
+        cfg = copy.deepcopy(_d2_config())
+        cfg["model"]["cross_attention"]["n_queries"] = 4
+        cfg["model"]["esm3_lora"]["enabled"] = True
+        cfg["model"]["esm3_lora"]["lora_start_block"] = 36
+
+        model = KICMModel(cfg)
+        model.eval()
+
+        tok = EsmSequenceTokenizer()
+        B = 2
+        encoded = tok(["MKTLL", "ACDE"], return_tensors="pt", padding=True)
+        seq_tokens = encoded["input_ids"]
+        pad_mask = encoded["attention_mask"].eq(0)
+
+        ph = torch.tensor([7.0, 7.0])
+        temp = torch.tensor([37.0, 37.0])
+        ph_known = torch.ones(B, dtype=torch.bool)
+        temp_known = torch.ones(B, dtype=torch.bool)
+        cofactor_fp = torch.zeros(B, 512)
+
+        with torch.no_grad():
+            preds = model(seq_tokens, pad_mask, ["CC(=O)O", "c1ccccc1"],
+                          ph, temp, ph_known, temp_known, cofactor_fp)
+        assert preds.shape == (B,), f"Expected ({B},), got {preds.shape}"
+        assert torch.isfinite(preds).all(), "Predictions contain NaN/Inf"
+
+    def test_esm3_lora_params_in_optimizer(self):
+        """With esm3_lora.enabled=True, optimizer must contain esm3_lora group."""
+        from unittest.mock import PropertyMock
+        from src.models.kicm_module import KICMLightningModule
+
+        cfg = copy.deepcopy(_d2_config())
+        cfg["model"]["esm3_lora"]["enabled"] = True
+        cfg["model"]["esm3_lora"]["lora_start_block"] = 36
+        cfg["training"]["lr"]["esm3_lora"] = 2.0e-5
+
+        module = KICMLightningModule(cfg)
+
+        mock_trainer = MagicMock()
+        type(mock_trainer).estimated_stepping_batches = PropertyMock(return_value=1000)
+        module._trainer = mock_trainer
+
+        opt_cfg = module.configure_optimizers()
+        group_names = [g["name"] for g in opt_cfg["optimizer"].param_groups]
+        assert "esm3_lora" in group_names, \
+            f"esm3_lora group missing. Found: {group_names}"
+        esm3_group = next(g for g in opt_cfg["optimizer"].param_groups
+                          if g["name"] == "esm3_lora")
+        # After LambdaLR, the "initial_lr" stores the configured value;
+        # "lr" may be 0.0 at step 0 due to warmup lambda.
+        esm3_lr = esm3_group.get("initial_lr", esm3_group["lr"])
+        assert abs(esm3_lr - 2.0e-5) < 1e-9, \
+            f"ESM3 LoRA LR should be 2e-5, got {esm3_lr}"
+        assert len(esm3_group["params"]) > 0, "ESM3 LoRA group is empty"
